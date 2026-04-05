@@ -1,0 +1,8 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+PYTHON="$(which python3)"
+
+pgrep -f "python3.*voice_app" | xargs kill 2>/dev/null
+sleep 0.3
+
+exec "$PYTHON" "$SCRIPT_DIR/voice_app.py"

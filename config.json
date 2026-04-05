@@ -1,0 +1,9 @@
+{
+  "languages": ["EN", "DA"],
+  "whisper_codes": {
+    "EN": "en",
+    "DA": "da",
+    "SE": "sv"
+  },
+  "hint_words": ["Jorgobé", "Søren", "skincare", "Danish accent", "Copenhagen"]
+}

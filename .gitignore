@@ -1,0 +1,7 @@
+models/
+__pycache__/
+*.pyc
+.DS_Store
+voice.log
+voice-launchd.log
+.voice_app.pid
