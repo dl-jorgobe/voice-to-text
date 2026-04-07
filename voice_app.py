@@ -2,7 +2,7 @@
 """
 Voice to Text — minimal floating macOS window.
 Hold Fn to record, release to transcribe and paste.
-Frosted glass UI inspired by iOS/visionOS.
+Muted blue-grey card UI with Ndot dot-matrix text animation.
 """
 
 import os
@@ -13,6 +13,8 @@ import tempfile
 import subprocess
 import threading
 import logging
+import time
+import math
 
 import numpy as np
 import sounddevice as sd
@@ -26,6 +28,7 @@ from AppKit import (
     NSVisualEffectView, NSVisualEffectBlendingModeBehindWindow,
     NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
     NSWindowStyleMaskMiniaturizable, NSWindowStyleMaskFullSizeContentView,
+    NSWindowStyleMaskBorderless,
     NSBackingStoreBuffered, NSFloatingWindowLevel,
     NSMakeRect, NSApplicationActivationPolicyAccessory,
     NSViewWidthSizable, NSViewHeightSizable,
@@ -50,8 +53,19 @@ from Quartz.CoreGraphics import (
     CGEventGetFlags,
 )
 
-# ── Config ──────────────────────────────────────────────────────────────
+# ── Load bundled Ndot font ─────────────────────────────────────────────
+import CoreText
+import Foundation
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+NDOT_FONT_PATH = os.path.join(SCRIPT_DIR, "Ndot55.ttf")
+if os.path.exists(NDOT_FONT_PATH):
+    font_url = Foundation.NSURL.fileURLWithPath_(NDOT_FONT_PATH)
+    CoreText.CTFontManagerRegisterFontsForURL(
+        font_url, CoreText.kCTFontManagerScopeProcess, None
+    )
+
+# ── Config ──────────────────────────────────────────────────────────────
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 with open(CONFIG_PATH) as f:
@@ -70,8 +84,24 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 FN_FLAG = 1 << 23
 
-WIN_WIDTH = 280
-WIN_HEIGHT = 276
+# ── Layout dimensions ──────────────────────────────────────────────────
+WIN_WIDTH = 300
+WIN_HEIGHT = 290
+MINI_WIDTH = 220
+MINI_HEIGHT = 42
+CORNER_RADIUS = 26
+
+# ── Color palette (neutral frosted glass — original style) ─────────────
+# Card background tint — very subtle warm-neutral
+BG_R, BG_G, BG_B = 0.45, 0.45, 0.48
+BG_ALPHA = 0.15
+# Darker inner fill
+INNER_R, INNER_G, INNER_B = 0.18, 0.17, 0.22
+# Text colors
+TEXT_PRIMARY = (1.0, 1.0, 1.0, 1.0)         # white
+TEXT_SECONDARY = (1.0, 1.0, 1.0, 0.45)      # muted white
+# Button pill (dark)
+BTN_R, BTN_G, BTN_B, BTN_A = 0.15, 0.17, 0.20, 0.85
 
 # ── Logging ─────────────────────────────────────────────────────────────
 LOG_PATH = os.path.join(SCRIPT_DIR, "voice.log")
@@ -104,7 +134,7 @@ class CircleView(NSView):
         path.fill()
 
 
-# ── Waveform view ───────────────────────────────────────────────────────
+# ── Waveform view (used in mini mode) ──────────────────────────────────
 class WaveformView(NSView):
     NUM_BARS = 7
     BAR_WIDTH = 4
@@ -117,7 +147,7 @@ class WaveformView(NSView):
         if self is None:
             return None
         self._levels = [0.0] * self.NUM_BARS
-        self._color = NSColor.systemRedColor()
+        self._color = NSColor.whiteColor()
         return self
 
     def setLevels_(self, levels):
@@ -139,6 +169,325 @@ class WaveformView(NSView):
             )
             self._color.setFill()
             path.fill()
+
+
+# ── Dot Text View (Ndot font with animated dots) ──────────────────────
+class DotTextView(NSView):
+    """Renders Ndot text normally when idle.
+    When recording, each letter's dots scatter outward from that letter's center,
+    driven by audio volume. Dots settle back smoothly when recording stops."""
+
+    DOT_RADIUS = 1.2
+
+    def initWithFrame_(self, frame):
+        self = objc.super(DotTextView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._text = ""
+        self._dots = []              # [(x, y), ...] base positions in view coords
+        self._scatter_dirs = []      # [(dx, dy), ...] normalized direction from letter center
+        self._dot_speeds = []        # per-dot random speed multiplier (0.5–2.0)
+        self._dot_drift = []         # per-dot subtle random drift angle offset
+        self._spread = 0.0           # current spread amount (0 = text, 1 = fully scattered)
+        self._target_spread = 0.0    # target spread (driven by audio)
+        self._anim_time = 0.0        # elapsed time for drift animation
+        self._color = NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_PRIMARY)
+        self._font_size = 24
+        self._animating = False
+        self._font = NSFont.fontWithName_size_("Ndot 55", 24) or \
+                     NSFont.fontWithName_size_("Ndot 57 Aligned", 24) or \
+                     NSFont.systemFontOfSize_(24)
+        self._attr_str = None
+        self._text_origin = AppKit.NSMakePoint(0, 0)
+        self._text_y_center = None   # if set, override vertical centering
+        self._max_scatter = 80.0     # max pixels dots can scatter
+        self._visible_dots = -1      # -1 = all visible, 0..N = how many to show
+        self._dot_order = []         # randomized order for reveal/dissolve
+        return self
+
+    def setText_(self, text):
+        self._text = text
+        self._build_attr_str()
+        self._extract_dots_per_letter()
+        self._visible_dots = -1  # all visible
+        import random
+        self._dot_order = list(range(len(self._dots)))
+        random.shuffle(self._dot_order)
+        self.setNeedsDisplay_(True)
+
+    def dissolve(self, callback=None):
+        """Animate dots disappearing one by one, fast. Calls callback when done."""
+        if not self._dots:
+            if callback:
+                callback()
+            return
+        total = len(self._dots)
+        import random
+        self._dot_order = list(range(total))
+        random.shuffle(self._dot_order)
+        self._visible_dots = total
+
+        def _run():
+            # Remove dots in batches for speed
+            batch = max(1, total // 15)  # ~15 steps
+            while self._visible_dots > 0:
+                self._visible_dots = max(0, self._visible_dots - batch)
+                def _r(): self.setNeedsDisplay_(True)
+                self.window().contentView().window().contentView()  # force
+                AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(_r)
+                time.sleep(0.02)
+            if callback:
+                AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(callback)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def reveal(self):
+        """Animate dots appearing one by one, fast."""
+        if not self._dots:
+            return
+        total = len(self._dots)
+        import random
+        self._dot_order = list(range(total))
+        random.shuffle(self._dot_order)
+        self._visible_dots = 0
+
+        def _run():
+            batch = max(1, total // 15)
+            while self._visible_dots < total:
+                self._visible_dots = min(total, self._visible_dots + batch)
+                def _r(): self.setNeedsDisplay_(True)
+                AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(_r)
+                time.sleep(0.02)
+            self._visible_dots = -1  # all visible
+            def _r(): self.setNeedsDisplay_(True)
+            AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(_r)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def setColor_(self, color):
+        self._color = color
+        self._build_attr_str()
+        self.setNeedsDisplay_(True)
+
+    def setAnimating_(self, animating):
+        self._animating = animating
+        if not animating:
+            self._target_spread = 0.0
+        self.setNeedsDisplay_(True)
+
+    def setSpread_(self, spread):
+        """Set target scatter spread (0.0 = text, 1.0 = max scatter)."""
+        self._target_spread = min(1.0, max(0.0, spread))
+
+    def updateAnimation(self):
+        """Smooth interpolation toward target spread. Call at ~20fps."""
+        self._anim_time += 0.05
+        if self._animating:
+            self._spread += (self._target_spread - self._spread) * 0.45
+        else:
+            # Smooth settle back
+            self._spread += (0.0 - self._spread) * 0.12
+            if self._spread < 0.005:
+                self._spread = 0.0
+        self.setNeedsDisplay_(True)
+
+    def _build_attr_str(self):
+        """Build the attributed string for direct text rendering."""
+        attrs = {
+            AppKit.NSFontAttributeName: self._font,
+            AppKit.NSForegroundColorAttributeName: self._color,
+        }
+        self._attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            self._text, attrs
+        )
+        size = self._attr_str.size()
+        view_w = self.bounds().size.width
+        view_h = self.bounds().size.height
+        x = (view_w - size.width) / 2
+        if self._text_y_center is not None:
+            y = self._text_y_center - size.height / 2
+        else:
+            y = (view_h - size.height) / 2
+        self._text_origin = AppKit.NSMakePoint(x, y)
+
+    def _extract_dots_per_letter(self):
+        """Render each letter individually to get per-letter dot groups,
+        then compute scatter directions from each letter's centroid."""
+        all_dots = []
+        all_dirs = []
+        all_speeds = []
+        all_drifts = []
+
+        # Get per-character x advances to know where each letter sits
+        attrs = {
+            AppKit.NSFontAttributeName: self._font,
+            AppKit.NSForegroundColorAttributeName: NSColor.whiteColor(),
+        }
+
+        # Measure full text width for centering
+        full_attr = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            self._text, attrs
+        )
+        full_size = full_attr.size()
+        view_w = self.bounds().size.width
+        view_h = self.bounds().size.height
+        text_x_offset = (view_w - full_size.width) / 2
+        if self._text_y_center is not None:
+            text_y_offset = self._text_y_center - full_size.height / 2
+        else:
+            text_y_offset = (view_h - full_size.height) / 2
+
+        # Get x position of each character using advancing
+        char_x_positions = [0.0]
+        for i in range(len(self._text)):
+            sub_attr = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                self._text[:i + 1], attrs
+            )
+            char_x_positions.append(sub_attr.size().width)
+
+        pt_h = int(full_size.height) + 10
+        step = 2
+
+        for ci, char in enumerate(self._text):
+            if char == ' ':
+                continue
+
+            # Render single char to bitmap
+            char_attr = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                char, attrs
+            )
+            char_size = char_attr.size()
+            cw = max(1, int(char_size.width) + 4)
+            ch = max(1, int(char_size.height) + 4)
+
+            bitmap = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+                None, cw, ch, 8, 4, True, False,
+                AppKit.NSCalibratedRGBColorSpace, 0, 0
+            )
+            if not bitmap:
+                continue
+
+            ctx = AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(bitmap)
+            if not ctx:
+                continue
+
+            AppKit.NSGraphicsContext.saveGraphicsState()
+            AppKit.NSGraphicsContext.setCurrentContext_(ctx)
+            NSColor.clearColor().setFill()
+            AppKit.NSBezierPath.fillRect_(NSMakeRect(0, 0, cw, ch))
+            char_attr.drawAtPoint_(AppKit.NSMakePoint(2, 2))
+            AppKit.NSGraphicsContext.restoreGraphicsState()
+
+            # Extract dots from this character
+            char_dots = []
+            for py in range(0, ch, step):
+                for px in range(0, cw, step):
+                    color = bitmap.colorAtX_y_(px, py)
+                    if color:
+                        try:
+                            a = color.alphaComponent()
+                        except Exception:
+                            continue
+                        if a > 0.3:
+                            # Position in view coords
+                            vx = text_x_offset + char_x_positions[ci] + float(px) - 2
+                            vy = text_y_offset + float(ch - py) - 2
+                            char_dots.append((vx, vy))
+
+            if not char_dots:
+                continue
+
+            # Compute centroid of this letter's dots
+            cx = sum(d[0] for d in char_dots) / len(char_dots)
+            cy = sum(d[1] for d in char_dots) / len(char_dots)
+
+            # Compute scatter direction for each dot (away from centroid)
+            # Add per-dot randomness for organic, weightless feel
+            import random
+            for (dx, dy) in char_dots:
+                dist = math.sqrt((dx - cx) ** 2 + (dy - cy) ** 2)
+                if dist > 0.1:
+                    nx = (dx - cx) / dist
+                    ny = (dy - cy) / dist
+                else:
+                    angle = hash((dx, dy)) % 628 / 100.0
+                    nx = math.cos(angle)
+                    ny = math.sin(angle)
+                # Add slight random angle deviation (±30°) for organic spread
+                angle_offset = (hash((int(dx * 7), int(dy * 13))) % 600 - 300) / 1000.0 * math.pi
+                cos_a = math.cos(angle_offset)
+                sin_a = math.sin(angle_offset)
+                nx2 = nx * cos_a - ny * sin_a
+                ny2 = nx * sin_a + ny * cos_a
+                all_dots.append((dx, dy))
+                all_dirs.append((nx2, ny2))
+                # Random speed: some dots fly faster than others (0.4 – 2.2)
+                speed = 0.4 + (hash((int(dx * 3), int(dy * 7))) % 180) / 100.0
+                all_speeds.append(speed)
+                # Random drift phase for floating wobble
+                drift = (hash((int(dx * 11), int(dy * 17))) % 628) / 100.0
+                all_drifts.append(drift)
+
+        self._dots = all_dots
+        self._scatter_dirs = all_dirs
+        self._dot_speeds = all_speeds
+        self._dot_drift = all_drifts
+        self._spread = 0.0
+        self._target_spread = 0.0
+        logging.info(f"DotTextView: extracted {len(self._dots)} dots from '{self._text}' ({len(self._text)} chars)")
+
+    def _is_dot_visible(self, i):
+        """Check if dot at index i should be drawn during dissolve/reveal."""
+        if self._visible_dots == -1:
+            return True  # all visible
+        if not self._dot_order:
+            return i < self._visible_dots
+        # _dot_order maps draw priority: first N in _dot_order are visible
+        try:
+            rank = self._dot_order.index(i)
+        except ValueError:
+            return True
+        return rank < self._visible_dots
+
+    def drawRect_(self, rect):
+        if self._visible_dots == 0:
+            return  # fully dissolved, draw nothing
+
+        if self._spread > 0.001 and self._dots:
+            # Animated mode: dots float away like weightless in space
+            self._color.setFill()
+            r = self.DOT_RADIUS
+            t = self._anim_time
+            for i, (x, y) in enumerate(self._dots):
+                if not self._is_dot_visible(i):
+                    continue
+                if i < len(self._scatter_dirs):
+                    sx, sy = self._scatter_dirs[i]
+                else:
+                    sx, sy = 0.0, 0.0
+                speed = self._dot_speeds[i] if i < len(self._dot_speeds) else 1.0
+                scatter = self._spread * self._max_scatter * speed
+                dx = x + sx * scatter
+                dy = y + sy * scatter
+                if self._spread > 0.01:
+                    drift_phase = self._dot_drift[i] if i < len(self._dot_drift) else 0.0
+                    wobble = math.sin(t * 2.5 + drift_phase) * self._spread * 6.0 * speed
+                    dx += -sy * wobble
+                    dy += sx * wobble
+                dot_rect = NSMakeRect(dx - r, dy - r, r * 2, r * 2)
+                path = AppKit.NSBezierPath.bezierPathWithOvalInRect_(dot_rect)
+                path.fill()
+        elif self._visible_dots != -1 and self._dots:
+            # Dissolve/reveal mode: draw individual dots
+            self._color.setFill()
+            r = self.DOT_RADIUS
+            for i, (x, y) in enumerate(self._dots):
+                if not self._is_dot_visible(i):
+                    continue
+                dot_rect = NSMakeRect(x - r, y - r, r * 2, r * 2)
+                path = AppKit.NSBezierPath.bezierPathWithOvalInRect_(dot_rect)
+                path.fill()
+        elif self._attr_str:
+            # Idle mode: draw text directly with Ndot font
+            self._attr_str.drawAtPoint_(self._text_origin)
 
 
 # ── Clickable history label ─────────────────────────────────────────────
@@ -183,7 +532,6 @@ class LangToggleView(NSView):
         return self._selected
 
     def mouseDown_(self, event):
-        # Toggle on any click anywhere in the view
         self._selected = 1 - self._selected
         self.setNeedsDisplay_(True)
         if self._callback:
@@ -201,7 +549,7 @@ class LangToggleView(NSView):
 
         # Track background
         track = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, r, r)
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.08).setFill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.10).setFill()
         track.fill()
 
         # Sliding indicator pill
@@ -268,11 +616,10 @@ class HandsFreeToggleView(NSView):
 
         # Track background
         track = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, r, r)
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.08).setFill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.10).setFill()
         track.fill()
 
         if self._active:
-            # Full highlight pill when on
             pad = 2
             pill_rect = NSMakeRect(pad, pad, w - pad * 2, h - pad * 2)
             pill_r = (h - pad * 2) / 2
@@ -282,7 +629,6 @@ class HandsFreeToggleView(NSView):
             NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.22).setFill()
             pill.fill()
 
-        # Label
         label = "● HANDS-FREE" if self._active else "HANDS-FREE"
         color = NSColor.whiteColor() if self._active else NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.45)
         font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold if self._active else NSFontWeightRegular)
@@ -297,6 +643,58 @@ class HandsFreeToggleView(NSView):
         attr_str.drawAtPoint_(AppKit.NSMakePoint(x, y))
 
 
+# ── Mini mode toggle button ────────────────────────────────────────────
+class MiniToggleView(NSView):
+    """Small clickable pill to toggle between full and mini mode."""
+    def initWithFrame_(self, frame):
+        self = objc.super(MiniToggleView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._callback = None
+        self._is_mini = False
+        return self
+
+    def setCallback_(self, cb):
+        self._callback = cb
+
+    def setMini_(self, mini):
+        self._is_mini = mini
+        self.setNeedsDisplay_(True)
+
+    def mouseDown_(self, event):
+        if self._callback:
+            self._callback()
+
+    def resetCursorRects(self):
+        self.addCursorRect_cursor_(self.bounds(), AppKit.NSCursor.pointingHandCursor())
+
+    def drawRect_(self, rect):
+        bounds = self.bounds()
+        w = bounds.size.width
+        h = bounds.size.height
+
+        # Draw a subtle pill background
+        pill = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, h / 2, h / 2
+        )
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.12).setFill()
+        pill.fill()
+
+        # Draw collapse/expand icon (two horizontal lines for collapse, expand arrows)
+        icon = "▾" if not self._is_mini else "▴"
+        font = NSFont.systemFontOfSize_weight_(10, NSFontWeightMedium)
+        color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.6)
+        attrs = {
+            AppKit.NSFontAttributeName: font,
+            AppKit.NSForegroundColorAttributeName: color,
+        }
+        attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(icon, attrs)
+        size = attr_str.size()
+        attr_str.drawAtPoint_(AppKit.NSMakePoint(
+            (w - size.width) / 2, (h - size.height) / 2
+        ))
+
+
 class VoiceToTextApp:
     def __init__(self):
         self.recording = False
@@ -306,9 +704,11 @@ class VoiceToTextApp:
         self.language = "en"
         self.hands_free_mode = False
         self._stop_clap_monitor = threading.Event()
+        self._is_mini = False
+        self._animating_waveform = False
 
         self.app = NSApplication.sharedApplication()
-        self.app.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular — shows dock dot
+        self.app.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
 
         self.build_window()
         self.set_dock_icon()
@@ -319,16 +719,15 @@ class VoiceToTextApp:
         icon = AppKit.NSImage.alloc().initWithSize_((size, size))
         icon.lockFocus()
 
-        # macOS icon sizing: 80% of canvas
         inset = size * 0.1
         icon_sz = size * 0.8
         radius = icon_sz * 0.22
         rect = NSMakeRect(inset, inset, icon_sz, icon_sz)
         shape = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, radius, radius)
 
-        # Gradient background
-        top_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.18, 0.17, 0.22, 1.0)
-        bot_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.08, 0.08, 0.10, 1.0)
+        # Gradient background — dark
+        top_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.14, 0.14, 0.16, 1.0)
+        bot_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.05, 0.05, 0.06, 1.0)
         gradient = AppKit.NSGradient.alloc().initWithStartingColor_endingColor_(bot_color, top_color)
         gradient.drawInBezierPath_angle_(shape, 90)
 
@@ -337,8 +736,8 @@ class VoiceToTextApp:
         shape.addClip()
         inner_rect = NSMakeRect(inset + 0.5, inset + 0.5, icon_sz - 1, icon_sz - 1)
         inner_shape = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(inner_rect, radius - 0.5, radius - 0.5)
-        hl_top = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.25)
-        hl_bot = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.05)
+        hl_top = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.15)
+        hl_bot = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.03)
         stroke_grad = AppKit.NSGradient.alloc().initWithStartingColor_endingColor_(hl_bot, hl_top)
         stroke_grad.drawInBezierPath_angle_(inner_shape, 90)
         fill_rect = NSMakeRect(inset + 1.5, inset + 1.5, icon_sz - 3, icon_sz - 3)
@@ -347,15 +746,15 @@ class VoiceToTextApp:
         gradient2.drawInBezierPath_angle_(fill_shape, 90)
         AppKit.NSGraphicsContext.currentContext().restoreGraphicsState()
 
-        # 7 dots in a line
-        num = 7
-        dot_r = icon_sz * 0.035
-        gap = icon_sz * 0.045
+        # 3 dots centered
+        num = 3
+        dot_r = icon_sz * 0.055
+        gap = icon_sz * 0.08
         total_w = num * (dot_r * 2) + (num - 1) * gap
         start_x = inset + (icon_sz - total_w) / 2
         cy = inset + icon_sz / 2
 
-        NSColor.whiteColor().setFill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.85).setFill()
         for i in range(num):
             cx = start_x + dot_r + i * (dot_r * 2 + gap)
             dot = AppKit.NSBezierPath.bezierPathWithOvalInRect_(
@@ -389,40 +788,47 @@ class VoiceToTextApp:
         self.window.setOpaque_(False)
         self.window.setBackgroundColor_(NSColor.clearColor())
         self.window.setHasShadow_(True)
-        self.window.setAlphaValue_(0.95)
+        self.window.setAlphaValue_(0.97)
 
-        # ── Liquid Glass background ──
+        # ── Hide window buttons (close/minimize/zoom) ──
+        for btn_type in [AppKit.NSWindowCloseButton, AppKit.NSWindowMiniaturizeButton, AppKit.NSWindowZoomButton]:
+            btn = self.window.standardWindowButton_(btn_type)
+            if btn:
+                btn.setHidden_(True)
+
+        # ── Muted blue-grey card background ──
         content = self.window.contentView()
         content.setWantsLayer_(True)
-        content.layer().setCornerRadius_(22)
+        content.layer().setCornerRadius_(CORNER_RADIUS)
         content.layer().setMasksToBounds_(True)
 
-        # Base tint — very subtle warm-neutral fill behind the blur
-        # so the glass has body even over dark backgrounds
+        # Base tint — muted blue-grey fill
         tint_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT))
         tint_view.setWantsLayer_(True)
-        tint_view.layer().setCornerRadius_(22)
+        tint_view.layer().setCornerRadius_(CORNER_RADIUS)
         tint_view.layer().setMasksToBounds_(True)
         tint_view.layer().setBackgroundColor_(
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.45, 0.45, 0.48, 0.15).CGColor()
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(BG_R, BG_G, BG_B, BG_ALPHA).CGColor()
         )
         content.addSubview_(tint_view)
+        self._tint_view = tint_view
 
-        # Primary blur — light, translucent material that refracts behind-window content
+        # Frosted blur — softer with blue-grey tint
         vibrancy = NSVisualEffectView.alloc().initWithFrame_(
             NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT)
         )
-        vibrancy.setMaterial_(13)  # NSVisualEffectMaterialHUDWindow — true glass
+        vibrancy.setMaterial_(13)  # NSVisualEffectMaterialHUDWindow
         vibrancy.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        vibrancy.setState_(1)  # Active
+        vibrancy.setState_(1)
         vibrancy.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         vibrancy.setWantsLayer_(True)
-        vibrancy.layer().setCornerRadius_(22)
+        vibrancy.layer().setCornerRadius_(CORNER_RADIUS)
         vibrancy.layer().setMasksToBounds_(True)
-        vibrancy.setAlphaValue_(0.75)  # let more of the background bleed through
+        vibrancy.setAlphaValue_(0.75)
         content.addSubview_(vibrancy)
+        self._vibrancy = vibrancy
 
-        # Specular highlight — bright arc across the top edge, like light catching glass
+        # Specular highlight — subtle edge glow
         from Quartz import CAGradientLayer, CAShapeLayer
         highlight_view = PassthroughView.alloc().initWithFrame_(NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT))
         highlight_view.setWantsLayer_(True)
@@ -430,7 +836,6 @@ class VoiceToTextApp:
 
         specular = CAGradientLayer.alloc().init()
         specular.setFrame_(Quartz.CGRectMake(0, 0, WIN_WIDTH, WIN_HEIGHT))
-        # In layer coords: bottom = visual top of window
         white_bright = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.30).CGColor()
         white_mid = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.06).CGColor()
         clear = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.0).CGColor()
@@ -439,48 +844,51 @@ class VoiceToTextApp:
         specular.setStartPoint_(Quartz.CGPointMake(0.5, 0.0))
         specular.setEndPoint_(Quartz.CGPointMake(0.5, 1.0))
 
-        # Mask so it only shows as a thin edge, not a full fill
         edge_mask = CAShapeLayer.alloc().init()
         edge_path = Quartz.CGPathCreateWithRoundedRect(
-            Quartz.CGRectMake(0.5, 0.5, WIN_WIDTH - 1, WIN_HEIGHT - 1), 22, 22, None
+            Quartz.CGRectMake(0.5, 0.5, WIN_WIDTH - 1, WIN_HEIGHT - 1),
+            CORNER_RADIUS, CORNER_RADIUS, None
         )
         edge_mask.setPath_(edge_path)
         edge_mask.setFillColor_(None)
         edge_mask.setStrokeColor_(NSColor.whiteColor().CGColor())
-        edge_mask.setLineWidth_(1.5)
+        edge_mask.setLineWidth_(1.0)
         specular.setMask_(edge_mask)
 
         highlight_view.layer().addSublayer_(specular)
         content.addSubview_(highlight_view)
+        self._highlight_view = highlight_view
 
-        # ── Waveform (always visible — white when idle, red when recording) ──
-        waveform_w = WaveformView.NUM_BARS * WaveformView.BAR_WIDTH + (WaveformView.NUM_BARS - 1) * WaveformView.BAR_GAP + 20
-        self.waveform = WaveformView.alloc().initWithFrame_(
-            NSMakeRect((WIN_WIDTH - waveform_w) / 2, 186, waveform_w, 40)
+        # ── Ndot headline ──
+        # dot_text covers full window so scattered dots can fly behind other views
+        self.dot_text = DotTextView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT)
         )
-        self.waveform._color = NSColor.whiteColor()
-        self.waveform.setLevels_([0.0] * WaveformView.NUM_BARS)
-        content.addSubview_(self.waveform)
+        self.dot_text._text_y_center = 200  # upper portion of window
+        self.dot_text.setText_("Say the word...")
+        content.addSubview_(self.dot_text)
 
-        # ── Status label (New York — Apple's modern serif) ──
+        # ── Status label (secondary info below the dots) ──
         self.status_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(20, 142, WIN_WIDTH - 40, 30)
+            NSMakeRect(20, 142, WIN_WIDTH - 40, 22)
         )
-        self.status_label.setStringValue_("Hold fn to record")
+        self.status_label.setStringValue_("")
         self.status_label.setBezeled_(False)
         self.status_label.setDrawsBackground_(False)
         self.status_label.setEditable_(False)
         self.status_label.setSelectable_(False)
-        self.status_label.setFont_(NSFont.fontWithName_size_("Charter-Roman", 19)
-                                   or NSFont.fontWithName_size_("Georgia", 19))
+        self.status_label.setFont_(NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular))
         self.status_label.setAlignment_(NSCenterTextAlignment)
+        self.status_label.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_SECONDARY)
+        )
         content.addSubview_(self.status_label)
 
         # ── Language toggle ──
         tog_w = 112
         tog_h = 26
         self.lang_toggle = LangToggleView.alloc().initWithFrame_(
-            NSMakeRect((WIN_WIDTH - tog_w) / 2, 106, tog_w, tog_h)
+            NSMakeRect((WIN_WIDTH - tog_w) / 2, 126, tog_w, tog_h)
         )
         self.lang_toggle.setCallback_(self._on_lang_toggle)
         content.addSubview_(self.lang_toggle)
@@ -489,10 +897,19 @@ class VoiceToTextApp:
         hf_w = 112
         hf_h = 24
         self.hf_toggle = HandsFreeToggleView.alloc().initWithFrame_(
-            NSMakeRect((WIN_WIDTH - hf_w) / 2, 74, hf_w, hf_h)
+            NSMakeRect((WIN_WIDTH - hf_w) / 2, 94, hf_w, hf_h)
         )
         self.hf_toggle.setCallback_(self._on_hands_free_toggle)
         content.addSubview_(self.hf_toggle)
+
+        # ── Mini mode toggle (top-right corner) ──
+        mini_btn_sz = 22
+        self.mini_toggle = MiniToggleView.alloc().initWithFrame_(
+            NSMakeRect(WIN_WIDTH - mini_btn_sz - 12, WIN_HEIGHT - mini_btn_sz - 12,
+                       mini_btn_sz, mini_btn_sz)
+        )
+        self.mini_toggle.setCallback_(self._toggle_mini_mode)
+        content.addSubview_(self.mini_toggle)
 
         # ── History (last 3 transcriptions, clickable to copy) ──
         self.history = []
@@ -509,12 +926,148 @@ class VoiceToTextApp:
             label.setSelectable_(False)
             label.setFont_(NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular))
             label.setAlignment_(NSCenterTextAlignment)
-            label.setTextColor_(NSColor.secondaryLabelColor())
+            label.setTextColor_(NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_SECONDARY))
             label.setLineBreakMode_(NSLineBreakByTruncatingTail)
             label.setClickCallback_(self.copy_to_clipboard)
             content.addSubview_(label)
             self.history_labels.append(label)
+
+        # Store refs to full-mode-only views (dot_text NOT included — it stays visible always)
+        self._full_mode_views = [
+            self.status_label,
+            self.lang_toggle, self.hf_toggle,
+        ] + self.history_labels
+
+        # Store full-mode and mini-mode frames for dot_text
+        self._dot_text_full_frame = (0, 0, WIN_WIDTH, WIN_HEIGHT)
+        self._dot_text_mini_frame = (0, 0, MINI_WIDTH, MINI_HEIGHT)
+
         self.window.makeKeyAndOrderFront_(None)
+
+    def _toggle_mini_mode(self):
+        self._is_mini = not self._is_mini
+        self.mini_toggle.setMini_(self._is_mini)
+
+        frame = self.window.frame()
+        ANIM_DURATION = 0.3
+
+        if self._is_mini:
+            # ── Collapse to mini pill ──
+            new_w = MINI_WIDTH
+            new_h = MINI_HEIGHT
+            new_x = frame.origin.x + (frame.size.width - new_w)
+            new_y = frame.origin.y + (frame.size.height - new_h)
+
+            # Fade out other views quickly
+            AppKit.NSAnimationContext.beginGrouping()
+            AppKit.NSAnimationContext.currentContext().setDuration_(ANIM_DURATION * 0.3)
+            for v in self._full_mode_views:
+                v.animator().setAlphaValue_(0.0)
+            AppKit.NSAnimationContext.endGrouping()
+
+            # Dissolve dots one by one, then resize window, then reveal in mini
+            def _do_collapse():
+                self.dot_text.dissolve(callback=None)
+                # Wait for dissolve to finish
+                while self.dot_text._visible_dots > 0:
+                    time.sleep(0.01)
+
+                def _resize():
+                    for v in self._full_mode_views:
+                        v.setHidden_(True)
+                        v.setAlphaValue_(1.0)
+
+                    # Resize window
+                    AppKit.NSAnimationContext.beginGrouping()
+                    AppKit.NSAnimationContext.currentContext().setDuration_(ANIM_DURATION)
+                    self.window.animator().setFrame_display_(
+                        NSMakeRect(new_x, new_y, new_w, new_h), True
+                    )
+                    self.mini_toggle.animator().setFrame_(NSMakeRect(
+                        new_w - 28, (new_h - 22) / 2, 22, 22
+                    ))
+                    AppKit.NSAnimationContext.endGrouping()
+                self.on_main(_resize)
+
+                time.sleep(ANIM_DURATION + 0.05)
+
+                def _reveal_mini():
+                    self.window.contentView().layer().setCornerRadius_(new_h / 2)
+                    self._tint_view.layer().setCornerRadius_(new_h / 2)
+                    self._vibrancy.layer().setCornerRadius_(new_h / 2)
+
+                    self.dot_text.setFrame_(NSMakeRect(*self._dot_text_mini_frame))
+                    self.dot_text._text_y_center = None
+                    self.dot_text.setText_(self._mini_text_for_state())
+                    self.dot_text.reveal()
+                self.on_main(_reveal_mini)
+            threading.Thread(target=_do_collapse, daemon=True).start()
+
+        else:
+            # ── Expand to full ──
+            new_w = WIN_WIDTH
+            new_h = WIN_HEIGHT
+            new_x = frame.origin.x + (frame.size.width - new_w)
+            new_y = frame.origin.y + (frame.size.height - new_h)
+
+            # Dissolve dots, then resize, then reveal
+            def _do_expand():
+                self.dot_text.dissolve(callback=None)
+                while self.dot_text._visible_dots > 0:
+                    time.sleep(0.01)
+
+                def _resize():
+                    self.window.contentView().layer().setCornerRadius_(CORNER_RADIUS)
+                    self._tint_view.layer().setCornerRadius_(CORNER_RADIUS)
+                    self._vibrancy.layer().setCornerRadius_(CORNER_RADIUS)
+
+                    for v in self._full_mode_views:
+                        v.setAlphaValue_(0.0)
+                        v.setHidden_(False)
+
+                    AppKit.NSAnimationContext.beginGrouping()
+                    AppKit.NSAnimationContext.currentContext().setDuration_(ANIM_DURATION)
+                    self.window.animator().setFrame_display_(
+                        NSMakeRect(new_x, new_y, new_w, new_h), True
+                    )
+                    self.mini_toggle.animator().setFrame_(NSMakeRect(
+                        WIN_WIDTH - 34, WIN_HEIGHT - 34, 22, 22
+                    ))
+                    AppKit.NSAnimationContext.endGrouping()
+                self.on_main(_resize)
+
+                time.sleep(ANIM_DURATION + 0.05)
+
+                def _reveal_full():
+                    self.dot_text.setFrame_(NSMakeRect(*self._dot_text_full_frame))
+                    self.dot_text._text_y_center = 200
+                    self.dot_text.setText_(self._full_text_for_state())
+                    self.dot_text.reveal()
+
+                    # Fade in other views
+                    AppKit.NSAnimationContext.beginGrouping()
+                    AppKit.NSAnimationContext.currentContext().setDuration_(0.2)
+                    for v in self._full_mode_views:
+                        v.animator().setAlphaValue_(1.0)
+                    AppKit.NSAnimationContext.endGrouping()
+                self.on_main(_reveal_full)
+            threading.Thread(target=_do_expand, daemon=True).start()
+
+    def _mini_text_for_state(self):
+        """Get the appropriate short text for mini mode based on current state."""
+        if self.recording:
+            return "Recording..."
+        if self.hands_free_mode:
+            return "Clap twice..."
+        return "Say the word..."
+
+    def _full_text_for_state(self):
+        """Get the appropriate full text based on current state."""
+        if self.recording:
+            return "Recording..."
+        if self.hands_free_mode:
+            return "Clap twice..."
+        return "Say the word..."
 
     def make_label(self, text, frame, size=13, weight=NSFontWeightRegular,
                    alignment=NSCenterTextAlignment, color=None):
@@ -538,37 +1091,48 @@ class VoiceToTextApp:
     def _on_hands_free_toggle(self, active):
         self.hands_free_mode = active
         logging.info(f"Hands-free mode: {active}")
-        # Sync Claude Code voice mode
+        # Write voice mode for Claude Code integration
         try:
-            voice_mode_path = os.path.expanduser("~/.config/claude-voice/voice_mode")
-            with open(voice_mode_path, "w") as f:
+            voice_dir = os.path.expanduser("~/.config/claude-voice")
+            os.makedirs(voice_dir, exist_ok=True)
+            with open(os.path.join(voice_dir, "voice_mode"), "w") as f:
                 f.write("on" if active else "off")
+            # Copy bundled speak.sh if not already present
+            speak_dst = os.path.join(voice_dir, "speak.sh")
+            if not os.path.exists(speak_dst):
+                speak_src = os.path.join(SCRIPT_DIR, "speak.sh")
+                if os.path.exists(speak_src):
+                    import shutil
+                    shutil.copy2(speak_src, speak_dst)
+                    os.chmod(speak_dst, 0o755)
         except Exception:
             logging.exception("Could not update voice_mode file")
         if active:
             def _():
-                self.status_label.setStringValue_("Clap twice to start")
+                self.dot_text.setText_("Clap twice...")
             self.on_main(_)
             self._stop_clap_monitor.clear()
             threading.Thread(target=self._clap_monitor, daemon=True).start()
         else:
             self._stop_clap_monitor.set()
             def _():
-                self.status_label.setStringValue_("Hold fn to record")
+                self.dot_text.setText_("Say the word...")
+                self.status_label.setStringValue_("")
             self.on_main(_)
 
     def _clap_monitor(self):
         """Single persistent stream for clap detection — handles both start and stop."""
-        import time
         CHUNK = 512
-        THRESHOLD = 0.15        # float32 peak (0.0–1.0)
-        MIN_CLAP_GAP = 0.2      # min seconds between detected claps
-        DOUBLE_CLAP_WINDOW = 0.9  # max seconds between two claps
-        MIN_RECORD_BEFORE_STOP = 1.0  # ignore claps in first second of recording
+        THRESHOLD = 0.15
+        MIN_CLAP_GAP = 0.2
+        DOUBLE_CLAP_WINDOW = 0.9
+        MIN_RECORD_BEFORE_STOP = 1.0
+        POST_TRANSCRIBE_COOLDOWN = 1.5  # ignore claps after transcription finishes
 
         clap_times = []
         last_clap_time = 0.0
-        record_start_time = [0.0]  # mutable for closure
+        record_start_time = [0.0]
+        last_transcribe_end = [0.0]  # track when transcription finishes
 
         def audio_cb(indata, frames, time_info, status):
             nonlocal last_clap_time, clap_times
@@ -578,8 +1142,11 @@ class VoiceToTextApp:
             peak = float(np.max(np.abs(indata)))
             now = time.time()
 
-            # Ignore claps immediately after recording starts (mic pop noise)
             if self.recording and (now - record_start_time[0]) < MIN_RECORD_BEFORE_STOP:
+                return
+
+            # Cooldown after transcription finishes to avoid phantom re-triggers
+            if not self.recording and (now - last_transcribe_end[0]) < POST_TRANSCRIBE_COOLDOWN:
                 return
 
             if peak < THRESHOLD or (now - last_clap_time) < MIN_CLAP_GAP:
@@ -592,27 +1159,26 @@ class VoiceToTextApp:
 
             if len(clap_times) == 1:
                 if not self.recording:
-                    # Single clap while idle — interrupt Matilda if she's speaking
                     if subprocess.run(["pgrep", "-x", "afplay"], capture_output=True).returncode == 0:
                         subprocess.run(["pkill", "-x", "afplay"], capture_output=True)
                         clap_times.clear()
                         logging.info("Single clap — interrupted Matilda")
                         return
-                    def _(): self.status_label.setStringValue_("Clap again…")
+                    def _(): self.dot_text.setText_("Clap again...")
                     self.on_main(_)
                     def _reset(w=DOUBLE_CLAP_WINDOW):
                         time.sleep(w + 0.1)
                         if self.hands_free_mode and not self.recording:
-                            def __(): self.status_label.setStringValue_("Clap twice to start")
+                            def __(): self.dot_text.setText_("Clap twice...")
                             self.on_main(__)
                     threading.Thread(target=_reset, daemon=True).start()
                 else:
-                    def _(): self.status_label.setStringValue_("Clap again to stop…")
+                    def _(): self.dot_text.setText_("Clap again...")
                     self.on_main(_)
                     def _reset(w=DOUBLE_CLAP_WINDOW):
                         time.sleep(w + 0.1)
                         if self.recording and self.hands_free_mode:
-                            def __(): self.status_label.setStringValue_("Clap twice to stop")
+                            def __(): self.dot_text.setText_("Clap twice...")
                             self.on_main(__)
                     threading.Thread(target=_reset, daemon=True).start()
 
@@ -620,11 +1186,14 @@ class VoiceToTextApp:
                 clap_times.clear()
                 if not self.recording:
                     record_start_time[0] = time.time()
-                    def _(): self.status_label.setStringValue_("Clap twice to stop")
+                    def _(): self.dot_text.setText_("Clap twice...")
                     self.on_main(_)
                     threading.Thread(target=self.start_recording, daemon=True).start()
                 else:
-                    threading.Thread(target=self.stop_and_transcribe, daemon=True).start()
+                    def _stop_and_mark():
+                        self.stop_and_transcribe()
+                        last_transcribe_end[0] = time.time()
+                    threading.Thread(target=_stop_and_mark, daemon=True).start()
 
         try:
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
@@ -641,19 +1210,20 @@ class VoiceToTextApp:
         subprocess.run(["pbcopy"], input=text.encode(), check=True)
         def _():
             self.status_label.setStringValue_("Copied!")
-            # Reset after 1.5s
             self.perform_selector_delayed("_reset_status")
         self.on_main(_)
 
     def _reset_status(self):
         def _():
             if not self.recording:
-                msg = "Clap twice to start" if self.hands_free_mode else "Hold fn to record"
-                self.status_label.setStringValue_(msg)
+                self.status_label.setStringValue_("")
+                if self.hands_free_mode:
+                    self.dot_text.setText_("Clap twice...")
+                else:
+                    self.dot_text.setText_("Say the word...")
         self.on_main(_)
 
     def perform_selector_delayed(self, sel_name):
-        import time
         def _delayed():
             time.sleep(1.5)
             self._reset_status()
@@ -662,33 +1232,44 @@ class VoiceToTextApp:
     def set_state_idle(self):
         self._animating_waveform = False
         def _():
-            self.waveform._color = NSColor.whiteColor()
-            self.waveform.setLevels_([0.0] * WaveformView.NUM_BARS)
-            msg = "Clap twice to start" if self.hands_free_mode else "Hold fn to record"
-            self.status_label.setStringValue_(msg)
+            self.dot_text.setAnimating_(False)
+            self.dot_text._spread = 0.0
+            self.dot_text._target_spread = 0.0
+            self.dot_text.setColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_PRIMARY)
+            )
+            if self.hands_free_mode:
+                self.dot_text.setText_("Clap twice...")
+            else:
+                self.dot_text.setText_("Say the word...")
+            self.status_label.setStringValue_("")
         self.on_main(_)
 
     def set_state_recording(self):
+        red = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.25, 0.25, 1.0)
         def _():
-            self.waveform._color = NSColor.systemRedColor()
-            self.status_label.setStringValue_("Recording…")
+            self.dot_text.setColor_(red)
+            self.dot_text.setText_("Recording...")
+            self.dot_text.setAnimating_(True)
+            self.status_label.setStringValue_("")
         self.on_main(_)
         self._animating_waveform = True
         threading.Thread(target=self._animate_waveform, daemon=True).start()
 
     def set_state_transcribing(self):
         self._animating_waveform = False
+        yellow = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.80, 0.20, 1.0)
         def _():
-            self.waveform._color = NSColor.systemOrangeColor()
-            self.waveform.setLevels_([0.3] * WaveformView.NUM_BARS)
-            self.status_label.setStringValue_("Transcribing…")
+            self.dot_text.setAnimating_(False)
+            self.dot_text.setColor_(yellow)
+            self.dot_text.setText_("Transcribing...")
+            self.status_label.setStringValue_("")
         self.on_main(_)
 
     def _animate_waveform(self):
-        import time
+        """Animate mini waveform bars and drive dot text scatter from audio level."""
         while self._animating_waveform:
             if self.audio_frames:
-                # Get the latest audio chunk and compute RMS levels
                 latest = self.audio_frames[-1].flatten().astype(np.float32)
                 chunk_size = max(1, len(latest) // WaveformView.NUM_BARS)
                 levels = []
@@ -697,17 +1278,36 @@ class VoiceToTextApp:
                     end = min(start + chunk_size, len(latest))
                     if start < len(latest):
                         rms = np.sqrt(np.mean(latest[start:end] ** 2)) / 32768.0
-                        level = min(1.0, rms * 25)  # High sensitivity for visible movement
+                        level = min(1.0, rms * 50)
                     else:
                         level = 0.0
                     levels.append(level)
             else:
                 levels = [0.05] * WaveformView.NUM_BARS
 
-            def _update(lvls=levels):
-                self.waveform.setLevels_(lvls)
+            # Average audio energy drives scatter spread
+            avg_level = sum(levels) / len(levels)
+
+            def _update(lvls=levels, spread=avg_level):
+                # Set target spread based on volume (louder = more scatter)
+                self.dot_text.setSpread_(spread)
+                self.dot_text.updateAnimation()
             self.on_main(_update)
             time.sleep(0.05)  # ~20fps
+
+        # After recording stops, keep updating for smooth settle
+        def _settle():
+            while self.dot_text._spread > 0.005:
+                def _():
+                    self.dot_text.updateAnimation()
+                self.on_main(_)
+                time.sleep(0.05)
+            def _final():
+                self.dot_text._spread = 0.0
+                self.dot_text._animating = False
+                self.dot_text.setNeedsDisplay_(True)
+            self.on_main(_final)
+        threading.Thread(target=_settle, daemon=True).start()
 
     def set_last_text(self, text):
         self.history.insert(0, text)
@@ -877,10 +1477,9 @@ class VoiceToTextApp:
             duration = len(audio_data) / SAMPLE_RATE
             logging.info(f"Audio: {duration:.1f}s")
 
-            # Check if audio is just silence (RMS below threshold)
             rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
             logging.info(f"Audio RMS: {rms:.1f}")
-            if rms < 200:  # Very quiet — likely no speech
+            if rms < 100:
                 logging.info("Audio too quiet, skipping transcription")
                 self.set_state_idle()
                 self.resume_all_audio()
@@ -907,7 +1506,6 @@ class VoiceToTextApp:
 
                 text = result.stdout.strip().strip("[] \n")
 
-                # Filter out prompt hallucinations and blank audio
                 PROMPT_WORDS = {w.lower() for w in HINT_WORDS} if HINT_WORDS else set()
                 text_words = set(text.lower().replace(",", "").replace(".", "").split())
                 if text_words.issubset(PROMPT_WORDS):
@@ -925,13 +1523,14 @@ class VoiceToTextApp:
                 logging.info(f"Transcribed: {text}")
                 self.set_last_text(text)
 
-                # Save existing clipboard, paste text, then restore
                 saved = self._clipboard_save()
                 subprocess.run(["pbcopy"], input=text.encode(), check=True)
                 self.simulate_paste()
                 if self.hands_free_mode:
                     self.simulate_return()
-                import time; time.sleep(0.15)  # let paste land before restoring
+                    time.sleep(0.4)  # let paste + Return land before restoring
+                else:
+                    time.sleep(0.15)
                 self._clipboard_restore(saved)
 
             finally:
@@ -970,10 +1569,9 @@ class VoiceToTextApp:
         CGEventPost(kCGHIDEventTap, key_up)
 
     def simulate_return(self):
-        import time
-        time.sleep(0.12)  # let paste land first
+        time.sleep(0.12)
         source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
-        key_down = CGEventCreateKeyboardEvent(source, 36, True)   # 36 = Return
+        key_down = CGEventCreateKeyboardEvent(source, 36, True)
         key_up = CGEventCreateKeyboardEvent(source, 36, False)
         CGEventPost(kCGHIDEventTap, key_down)
         CGEventPost(kCGHIDEventTap, key_up)
@@ -999,6 +1597,7 @@ class VoiceToTextApp:
             return event
 
         event_mask = CGEventMaskBit(kCGEventFlagsChanged)
+        self._event_tap_callback = callback  # prevent GC
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
@@ -1012,7 +1611,9 @@ class VoiceToTextApp:
             logging.error("Could not create event tap")
             return
 
+        self._event_tap = tap  # prevent GC
         run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        self._event_tap_source = run_loop_source  # prevent GC
         Quartz.CFRunLoopAddSource(
             Quartz.CFRunLoopGetMain(), run_loop_source, Quartz.kCFRunLoopCommonModes
         )
@@ -1024,11 +1625,10 @@ class VoiceToTextApp:
 
 
 if __name__ == "__main__":
-    # Set process name so dock shows "Voice to Text" not "Python"
     AppKit.NSProcessInfo.processInfo().setProcessName_("Voice to Text")
     if not os.path.exists(MODEL_PATH):
-        print(f"Model not found at {MODEL_PATH}")
-        sys.exit(1)
+        logging.warning(f"Model not found at {MODEL_PATH} — transcription disabled")
+        print(f"Warning: Model not found at {MODEL_PATH} — UI will run but transcription won't work")
 
     # Kill any existing instances
     import signal
@@ -1039,7 +1639,7 @@ if __name__ == "__main__":
             old_pid = int(open(pid_file).read().strip())
             if old_pid != my_pid:
                 os.kill(old_pid, signal.SIGTERM)
-                import time; time.sleep(0.5)
+                time.sleep(0.5)
         except (ProcessLookupError, ValueError):
             pass
     with open(pid_file, "w") as f:
