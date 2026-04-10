@@ -179,10 +179,10 @@ MINI_WIDTH = 220
 MINI_HEIGHT = 42
 CORNER_RADIUS = 36
 
-# ── Color palette (neutral frosted glass — original style) ─────────────
-# Card background tint — very subtle warm-neutral
-BG_R, BG_G, BG_B = 0.45, 0.45, 0.48
-BG_ALPHA = 0.15
+# ── Color palette (Liquid Glass — transparent, refractive) ─────────────
+# Card background tint — barely there, let the blur do the work
+BG_R, BG_G, BG_B = 0.35, 0.35, 0.40
+BG_ALPHA = 0.08
 # Darker inner fill
 INNER_R, INNER_G, INNER_B = 0.18, 0.17, 0.22
 # Text colors
@@ -1105,7 +1105,7 @@ class VoiceToTextApp:
         self.window.setOpaque_(False)
         self.window.setBackgroundColor_(NSColor.clearColor())
         self.window.setHasShadow_(True)
-        self.window.setAlphaValue_(0.97)
+        self.window.setAlphaValue_(0.95)
 
         # ── Hide window buttons (close/minimize/zoom) ──
         for btn_type in [AppKit.NSWindowCloseButton, AppKit.NSWindowMiniaturizeButton, AppKit.NSWindowZoomButton]:
@@ -1136,7 +1136,8 @@ class VoiceToTextApp:
         vibrancy = NSVisualEffectView.alloc().initWithFrame_(
             NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT)
         )
-        vibrancy.setMaterial_(13)
+        # Liquid Glass: light material — diffuse, not blurry
+        vibrancy.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
         vibrancy.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         vibrancy.setState_(1)
         vibrancy.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -1144,7 +1145,7 @@ class VoiceToTextApp:
         vibrancy.layer().setCornerRadius_(CORNER_RADIUS)
         vibrancy.layer().setCornerCurve_("continuous")
         vibrancy.layer().setMasksToBounds_(True)
-        vibrancy.setAlphaValue_(0.75)
+        vibrancy.setAlphaValue_(0.95)
         content.addSubview_(vibrancy)
         self._vibrancy = vibrancy
 
@@ -1156,11 +1157,13 @@ class VoiceToTextApp:
 
         specular = CAGradientLayer.alloc().init()
         specular.setFrame_(Quartz.CGRectMake(0, 0, WIN_WIDTH, WIN_HEIGHT))
-        white_bright = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.30).CGColor()
-        white_mid = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.06).CGColor()
+        # Liquid Glass: bright specular edge — light bending on curved surface
+        white_bright = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.45).CGColor()
+        white_mid = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.12).CGColor()
+        white_low = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.04).CGColor()
         clear = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.0).CGColor()
-        specular.setColors_([clear, white_mid, white_bright])
-        specular.setLocations_([0.0, 0.75, 1.0])
+        specular.setColors_([clear, white_low, white_mid, white_bright])
+        specular.setLocations_([0.0, 0.4, 0.8, 1.0])
         specular.setStartPoint_(Quartz.CGPointMake(0.5, 0.0))
         specular.setEndPoint_(Quartz.CGPointMake(0.5, 1.0))
 
@@ -1172,7 +1175,7 @@ class VoiceToTextApp:
         edge_mask.setPath_(edge_path)
         edge_mask.setFillColor_(None)
         edge_mask.setStrokeColor_(NSColor.whiteColor().CGColor())
-        edge_mask.setLineWidth_(1.0)
+        edge_mask.setLineWidth_(1.5)
         specular.setMask_(edge_mask)
 
         highlight_view.layer().addSublayer_(specular)
@@ -1353,12 +1356,13 @@ class VoiceToTextApp:
             threading.Thread(target=_do_collapse, daemon=True).start()
 
         else:
-            # ── Expand to full — always top-center ──
-            screen = AppKit.NSScreen.mainScreen().frame()
+            # ── Expand from current position ──
+            cur = self.window.frame()
             new_w = WIN_WIDTH
             new_h = WIN_HEIGHT
-            new_x = (screen.size.width - new_w) / 2
-            new_y = screen.size.height - new_h - 40
+            # Keep centered on the pill's horizontal center, expand downward
+            new_x = cur.origin.x + (cur.size.width - new_w) / 2
+            new_y = cur.origin.y + cur.size.height - new_h
 
             def _do_expand():
               try:
