@@ -89,9 +89,12 @@ MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-smal
 
 def _find_whisper_cli():
     """Find whisper-cli, checking common locations."""
-    result = subprocess.run(["which", "whisper-cli"], capture_output=True, text=True)
-    if result.stdout.strip():
-        return result.stdout.strip()
+    try:
+        result = subprocess.run(["which", "whisper-cli"], capture_output=True, text=True)
+        if result.stdout.strip():
+            return result.stdout.strip()
+    except FileNotFoundError:
+        pass
     for path in ["/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"]:
         if os.path.exists(path):
             return path
@@ -102,7 +105,6 @@ WHISPER_CMD = _find_whisper_cli()
 def _first_run_setup():
     """Check dependencies and download model on first run. Returns True if ready."""
     global WHISPER_CMD, MODEL_PATH
-    ready = True
 
     # Check for Homebrew
     has_brew = subprocess.run(["which", "brew"], capture_output=True).returncode == 0
@@ -1211,6 +1213,7 @@ class VoiceToTextApp:
         self._dot_text_mini_frame = (0, 0, MINI_WIDTH, MINI_HEIGHT)
 
         self.window.makeKeyAndOrderFront_(None)
+        self.app.activateIgnoringOtherApps_(True)
 
     def _update_highlight_edge(self, w, h, radius):
         """Rebuild the specular highlight mask for a given size and corner radius."""
@@ -1827,8 +1830,9 @@ class VoiceToTextApp:
                     wf.setframerate(SAMPLE_RATE)
                     wf.writeframes(audio_data.tobytes())
 
-                whisper_args = [WHISPER_CMD, "-m", MODEL_PATH, "-f", tmp.name, "--no-timestamps",
-                     "-l", self.language]
+                whisper_args = [WHISPER_CMD, "-m", MODEL_PATH, "-f", tmp.name, "--no-timestamps"]
+                if self.language and self.language != "auto":
+                    whisper_args += ["-l", self.language]
                 if HINT_WORDS:
                     whisper_args += ["--prompt", ", ".join(HINT_WORDS)]
                 result = subprocess.run(
@@ -1842,7 +1846,7 @@ class VoiceToTextApp:
 
                 PROMPT_WORDS = {w.lower() for w in HINT_WORDS} if HINT_WORDS else set()
                 text_words = set(text.lower().replace(",", "").replace(".", "").split())
-                if text_words.issubset(PROMPT_WORDS):
+                if text_words and text_words.issubset(PROMPT_WORDS):
                     logging.info(f"Filtered prompt hallucination: {text}")
                     self.set_state_idle()
                     self.resume_all_audio()
@@ -2025,3 +2029,10 @@ if __name__ == "__main__":
         print(f"Fatal error: {e}")
         import traceback; traceback.print_exc()
         sys.exit(1)
+    finally:
+        # Clean up PID file on exit
+        try:
+            if os.path.exists(pid_file):
+                os.unlink(pid_file)
+        except OSError:
+            pass
