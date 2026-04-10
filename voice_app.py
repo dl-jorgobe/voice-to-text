@@ -737,29 +737,14 @@ class LangDropdownView(NSView):
         self._popup_rows = []
         for idx, (code, name) in enumerate(WHISPER_LANGUAGES):
             y = idx * row_h
-            btn = AppKit.NSButton.alloc().initWithFrame_(
+            btn = HoverButton.alloc().initWithFrame_(
                 NSMakeRect(4, y, popup_w - 8, row_h)
             )
-            btn.setBezelStyle_(0)  # NSBezelStyleInline = 0 doesn't exist, use borderless
             btn.setBordered_(False)
             btn.setWantsLayer_(True)
             btn.layer().setCornerRadius_(8)
-
-            # Attributed title
-            is_sel = (code == self._selected_code)
-            weight = NSFontWeightSemibold if is_sel else NSFontWeightRegular
-            color = NSColor.whiteColor() if is_sel else \
-                    NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.65)
-            font = NSFont.systemFontOfSize_weight_(11, weight)
-            prefix = "✓ " if is_sel else "  "
-            attrs = {
-                AppKit.NSFontAttributeName: font,
-                AppKit.NSForegroundColorAttributeName: color,
-            }
-            title = AppKit.NSAttributedString.alloc().initWithString_attributes_(
-                prefix + name.upper(), attrs
-            )
-            btn.setAttributedTitle_(title)
+            btn.setNameText_(name.upper())
+            btn.setSelected_(code == self._selected_code)
             btn.setAlignment_(NSCenterTextAlignment)
             btn.setTag_(idx)
             btn.setTarget_(self)
@@ -824,7 +809,7 @@ class LangDropdownView(NSView):
         track.fill()
 
         # Language name + arrow — centered together
-        label = f"{self._selected_name.upper()} ▾"
+        label = self._selected_name.upper()
         font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
         color = NSColor.whiteColor()
         attrs = {
@@ -837,6 +822,68 @@ class LangDropdownView(NSView):
         y = (h - size.height) / 2
         attr_str.drawAtPoint_(AppKit.NSMakePoint(x, y))
 
+
+
+# ── Hoverable language row ─────────────────────────────────────────────
+class HoverButton(AppKit.NSButton):
+    def initWithFrame_(self, frame):
+        self = objc.super(HoverButton, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._is_selected = False
+        self._is_hovered = False
+        self._normal_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.55)
+        self._hover_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.85)
+        self._selected_color = NSColor.whiteColor()
+        self._name_text = ""
+        # Set up tracking area for hover
+        tracking = AppKit.NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(),
+            AppKit.NSTrackingMouseEnteredAndExited | AppKit.NSTrackingActiveAlways | AppKit.NSTrackingInVisibleRect,
+            self, None,
+        )
+        self.addTrackingArea_(tracking)
+        return self
+
+    def setSelected_(self, selected):
+        self._is_selected = selected
+        self._update_appearance()
+
+    def setNameText_(self, text):
+        self._name_text = text
+        self._update_appearance()
+
+    def mouseEntered_(self, event):
+        self._is_hovered = True
+        self._update_appearance()
+
+    def mouseExited_(self, event):
+        self._is_hovered = False
+        self._update_appearance()
+
+    def _update_appearance(self):
+        if self._is_selected:
+            color = self._selected_color
+            weight = NSFontWeightSemibold
+        elif self._is_hovered:
+            color = self._hover_color
+            weight = NSFontWeightMedium
+        else:
+            color = self._normal_color
+            weight = NSFontWeightRegular
+
+        font = NSFont.systemFontOfSize_weight_(11, weight)
+        attrs = {
+            AppKit.NSFontAttributeName: font,
+            AppKit.NSForegroundColorAttributeName: color,
+        }
+        title = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            self._name_text, attrs
+        )
+        self.setAttributedTitle_(title)
+
+    def resetCursorRects(self):
+        self.addCursorRect_cursor_(self.bounds(), AppKit.NSCursor.pointingHandCursor())
 
 
 # ── Flipped view (for top-to-bottom layout in scroll views) ────────────
@@ -972,6 +1019,10 @@ class VoiceToTextApp:
         self._is_mini = False
         self._animating_waveform = False
         self._mini_lock = threading.Lock()
+        self._auto_stop_enabled = False
+        self._last_speech_time = 0.0
+        self._has_spoken = False
+        self._speech_threshold = 300  # RMS threshold for "speaking" (int16 audio)
 
         self.app = NSApplication.sharedApplication()
         self.app.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
@@ -1371,7 +1422,7 @@ class VoiceToTextApp:
         if self.recording:
             return "Recording..."
         if self.hands_free_mode:
-            return "Clap twice..."
+            return "Clap to talk..."
         return "Say the word..."
 
     def _full_text_for_state(self):
@@ -1379,7 +1430,7 @@ class VoiceToTextApp:
         if self.recording:
             return "Recording..."
         if self.hands_free_mode:
-            return "Clap twice..."
+            return "Clap to talk..."
         return "Say the word..."
 
     def make_label(self, text, frame, size=13, weight=NSFontWeightRegular,
@@ -1403,25 +1454,10 @@ class VoiceToTextApp:
     def _on_hands_free_toggle(self, active):
         self.hands_free_mode = active
         logging.info(f"Hands-free mode: {active}")
-        # Write voice mode for Claude Code integration
-        try:
-            voice_dir = os.path.expanduser("~/.config/claude-voice")
-            os.makedirs(voice_dir, exist_ok=True)
-            with open(os.path.join(voice_dir, "voice_mode"), "w") as f:
-                f.write("on" if active else "off")
-            # Copy bundled speak.sh if not already present
-            speak_dst = os.path.join(voice_dir, "speak.sh")
-            if not os.path.exists(speak_dst):
-                speak_src = os.path.join(SCRIPT_DIR, "speak.sh")
-                if os.path.exists(speak_src):
-                    import shutil
-                    shutil.copy2(speak_src, speak_dst)
-                    os.chmod(speak_dst, 0o755)
-        except Exception:
-            logging.exception("Could not update voice_mode file")
+        threading.Thread(target=self._setup_voice_mode, args=(active,), daemon=True).start()
         if active:
             def _():
-                self.dot_text.setText_("Clap twice...")
+                self.dot_text.setText_("Clap to talk...")
             self.on_main(_)
             self._stop_clap_monitor.clear()
             threading.Thread(target=self._clap_monitor, daemon=True).start()
@@ -1432,32 +1468,99 @@ class VoiceToTextApp:
                 self.status_label.setStringValue_("")
             self.on_main(_)
 
-    def _clap_monitor(self):
-        """Single persistent stream for clap detection — handles both start and stop."""
-        CHUNK = 512
-        THRESHOLD = 0.15
-        MIN_CLAP_GAP = 0.2
-        DOUBLE_CLAP_WINDOW = 0.9
-        MIN_RECORD_BEFORE_STOP = 1.0
-        POST_TRANSCRIBE_COOLDOWN = 1.5  # ignore claps after transcription finishes
+    def _setup_voice_mode(self, active):
+        """Configure voice mode: speak.sh, voice_mode flag, and Claude Code hook."""
+        try:
+            voice_dir = os.path.expanduser("~/.config/claude-voice")
+            os.makedirs(voice_dir, exist_ok=True)
 
-        clap_times = []
+            # Write on/off flag
+            with open(os.path.join(voice_dir, "voice_mode"), "w") as f:
+                f.write("on" if active else "off")
+
+            # Write default speak.sh if none exists (macOS say — no API needed)
+            speak_dst = os.path.join(voice_dir, "speak.sh")
+            if not os.path.exists(speak_dst):
+                default_speak = '''#!/bin/bash
+# Say the word... — Text-to-Speech for hands-free mode
+# Uses macOS built-in "say" command (free, no API needed)
+# Change VOICE to any installed voice: say -v '?' to list all
+
+VOICE="Samantha"
+
+TEXT="$1"
+if [ -z "$TEXT" ]; then
+  echo "Usage: speak.sh \\"text to speak\\""
+  exit 1
+fi
+
+say -v "$VOICE" "$TEXT" &
+SAY_PID=$!
+trap "kill $SAY_PID 2>/dev/null" EXIT
+wait $SAY_PID 2>/dev/null
+'''
+                with open(speak_dst, "w") as f:
+                    f.write(default_speak)
+                os.chmod(speak_dst, 0o755)
+                logging.info("Created default speak.sh with macOS Samantha voice")
+
+            # Auto-configure Claude Code hook for voice responses
+            claude_dir = os.path.expanduser("~/.claude")
+            settings_path = os.path.join(claude_dir, "settings.json")
+            hook_command = 'bash -c \'if [ "$(cat ~/.config/claude-voice/voice_mode 2>/dev/null)" = "on" ]; then ~/.config/claude-voice/speak.sh "$(cat /dev/stdin | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get(\\\"message\\\",\\\"\\\"))" 2>/dev/null)" & fi\''
+
+            if os.path.exists(settings_path):
+                with open(settings_path, "r") as f:
+                    settings = json.load(f)
+            else:
+                os.makedirs(claude_dir, exist_ok=True)
+                settings = {}
+
+            # Check if our hook already exists
+            hooks = settings.get("hooks", {})
+            stop_hooks = hooks.get("Stop", [])
+            already_installed = any(
+                "claude-voice" in str(h) for h in stop_hooks
+            )
+
+            if not already_installed:
+                stop_hooks.append({
+                    "matcher": "",
+                    "hooks": [{
+                        "type": "command",
+                        "command": hook_command,
+                        "timeout": 60
+                    }]
+                })
+                hooks["Stop"] = stop_hooks
+                settings["hooks"] = hooks
+                with open(settings_path, "w") as f:
+                    json.dump(settings, f, indent=2)
+                logging.info("Installed Claude Code voice hook in settings.json")
+
+        except Exception:
+            logging.exception("Could not set up voice mode")
+
+    def _clap_monitor(self):
+        """Single persistent stream for clap detection.
+        Single firm clap to start recording. Auto-stops on silence."""
+        CHUNK = 512
+        THRESHOLD = 0.25          # higher threshold = firmer clap needed, fewer false positives
+        MIN_CLAP_GAP = 0.5       # minimum gap between clap triggers
+        POST_TRANSCRIBE_COOLDOWN = 2.0
+
         last_clap_time = 0.0
-        record_start_time = [0.0]
-        last_transcribe_end = [0.0]  # track when transcription finishes
+        last_transcribe_end = [0.0]
 
         def audio_cb(indata, frames, time_info, status):
-            nonlocal last_clap_time, clap_times
+            nonlocal last_clap_time
             if self._stop_clap_monitor.is_set():
                 return
 
             peak = float(np.max(np.abs(indata)))
             now = time.time()
 
-            if self.recording and (now - record_start_time[0]) < MIN_RECORD_BEFORE_STOP:
-                return
-
-            # Cooldown after transcription finishes to avoid phantom re-triggers
+            # Cooldown after transcription finishes
             if not self.recording and (now - last_transcribe_end[0]) < POST_TRANSCRIBE_COOLDOWN:
                 return
 
@@ -1465,47 +1568,19 @@ class VoiceToTextApp:
                 return
 
             last_clap_time = now
-            clap_times.append(now)
-            clap_times[:] = [t for t in clap_times if now - t <= DOUBLE_CLAP_WINDOW]
-            logging.info(f"Clap detected — peak={peak:.3f}, count={len(clap_times)}, recording={self.recording}")
+            logging.info(f"Clap detected — peak={peak:.3f}, recording={self.recording}")
 
-            if len(clap_times) == 1:
-                if not self.recording:
-                    if subprocess.run(["pgrep", "-x", "afplay"], capture_output=True).returncode == 0:
-                        subprocess.run(["pkill", "-x", "afplay"], capture_output=True)
-                        clap_times.clear()
-                        logging.info("Single clap — interrupted Matilda")
-                        return
-                    def _(): self.dot_text.setText_("Clap again...")
-                    self.on_main(_)
-                    def _reset(w=DOUBLE_CLAP_WINDOW):
-                        time.sleep(w + 0.1)
-                        if self.hands_free_mode and not self.recording:
-                            def __(): self.dot_text.setText_("Clap twice...")
-                            self.on_main(__)
-                    threading.Thread(target=_reset, daemon=True).start()
-                else:
-                    def _(): self.dot_text.setText_("Clap again...")
-                    self.on_main(_)
-                    def _reset(w=DOUBLE_CLAP_WINDOW):
-                        time.sleep(w + 0.1)
-                        if self.recording and self.hands_free_mode:
-                            def __(): self.dot_text.setText_("Clap twice...")
-                            self.on_main(__)
-                    threading.Thread(target=_reset, daemon=True).start()
-
-            elif len(clap_times) >= 2:
-                clap_times.clear()
-                if not self.recording:
-                    record_start_time[0] = time.time()
-                    def _(): self.dot_text.setText_("Clap twice...")
-                    self.on_main(_)
-                    threading.Thread(target=self.start_recording, daemon=True).start()
-                else:
-                    def _stop_and_mark():
-                        self.stop_and_transcribe()
-                        last_transcribe_end[0] = time.time()
-                    threading.Thread(target=_stop_and_mark, daemon=True).start()
+            if not self.recording:
+                # Interrupt TTS if playing
+                if subprocess.run(["pgrep", "-x", "afplay"], capture_output=True).returncode == 0:
+                    subprocess.run(["pkill", "-x", "afplay"], capture_output=True)
+                    logging.info("Clap — interrupted Matilda")
+                    return
+                # Start recording (auto-stop on silence handles the rest)
+                def _start():
+                    self.start_recording()
+                    last_transcribe_end[0] = 0.0
+                threading.Thread(target=_start, daemon=True).start()
 
         try:
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
@@ -1530,7 +1605,7 @@ class VoiceToTextApp:
             if not self.recording:
                 self.status_label.setStringValue_("")
                 if self.hands_free_mode:
-                    self.dot_text.setText_("Clap twice...")
+                    self.dot_text.setText_("Clap to talk...")
                 else:
                     self.dot_text.setText_("Say the word...")
         self.on_main(_)
@@ -1551,11 +1626,22 @@ class VoiceToTextApp:
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_PRIMARY)
             )
             if self.hands_free_mode:
-                self.dot_text.setText_("Clap twice...")
+                self.dot_text.setText_("Clap to talk...")
             else:
                 self.dot_text.setText_("Say the word...")
             self.status_label.setStringValue_("")
         self.on_main(_)
+
+    def _play_sound(self, name=None, path=None):
+        """Play a sound (non-blocking). Use path for custom sounds, name for system sounds."""
+        if path:
+            sound = AppKit.NSSound.alloc().initWithContentsOfFile_byReference_(path, True)
+        else:
+            sound = AppKit.NSSound.soundNamed_(name)
+        if sound:
+            sound.play()
+
+    _NOTIFY_SOUND = "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/head_gestures_partial_nod.caf"
 
     def set_state_recording(self):
         red = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.25, 0.25, 1.0)
@@ -1564,6 +1650,8 @@ class VoiceToTextApp:
             self.dot_text.setText_("Recording...")
             self.dot_text.setAnimating_(True)
             self.status_label.setStringValue_("")
+            if self.hands_free_mode:
+                self._play_sound(path=self._NOTIFY_SOUND)
         self.on_main(_)
         self._animating_waveform = True
         threading.Thread(target=self._animate_waveform, daemon=True).start()
@@ -1576,6 +1664,8 @@ class VoiceToTextApp:
             self.dot_text.setColor_(yellow)
             self.dot_text.setText_("Transcribing...")
             self.status_label.setStringValue_("")
+            if self.hands_free_mode:
+                self._play_sound(path=self._NOTIFY_SOUND)
         self.on_main(_)
 
     def _animate_waveform(self):
@@ -1759,6 +1849,17 @@ class VoiceToTextApp:
     def audio_callback(self, indata, frames, time_info, status):
         if self.recording:
             self.audio_frames.append(indata.copy())
+            # Auto-stop on silence in hands-free mode
+            if self._auto_stop_enabled:
+                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                now = time.time()
+                if rms > self._speech_threshold:
+                    self._last_speech_time = now
+                    self._has_spoken = True
+                # Stop after 2s of silence, but only if user has spoken at least once
+                if self._has_spoken and (now - self._last_speech_time) > 2.0:
+                    self._auto_stop_enabled = False
+                    threading.Thread(target=self.stop_and_transcribe, daemon=True).start()
 
     def start_recording(self):
         try:
@@ -1769,6 +1870,9 @@ class VoiceToTextApp:
                 self._stop_clap_monitor.set()
                 time.sleep(0.05)  # let the clap stream close
             self.audio_frames = []
+            self._auto_stop_enabled = self.hands_free_mode
+            self._last_speech_time = time.time()
+            self._has_spoken = False
             self.recording = True
             self.stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=CHANNELS,
@@ -1861,15 +1965,17 @@ class VoiceToTextApp:
                 logging.info(f"Transcribed: {text}")
                 self.set_last_text(text)
 
-                saved = self._clipboard_save()
-                subprocess.run(["pbcopy"], input=text.encode(), check=True)
-                self.simulate_paste()
                 if self.hands_free_mode:
+                    # Direct typing — no clipboard interference
+                    self.type_text(text)
                     self.simulate_return()
-                    time.sleep(0.8)  # let paste + Return land before restoring
                 else:
-                    time.sleep(0.5)  # give target app time to process paste
-                self._clipboard_restore(saved)
+                    # Clipboard paste for Fn mode (faster for long text)
+                    saved = self._clipboard_save()
+                    subprocess.run(["pbcopy"], input=text.encode(), check=True)
+                    self.simulate_paste()
+                    time.sleep(0.5)
+                    self._clipboard_restore(saved)
 
             finally:
                 os.unlink(tmp.name)
@@ -1901,6 +2007,18 @@ class VoiceToTextApp:
         pb.clearContents()
         for t, data in saved.items():
             pb.setData_forType_(data, t)
+
+    def type_text(self, text):
+        """Type text directly via CGEvents — no clipboard needed."""
+        source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
+        for char in text:
+            key_down = CGEventCreateKeyboardEvent(source, 0, True)
+            key_up = CGEventCreateKeyboardEvent(source, 0, False)
+            Quartz.CGEventKeyboardSetUnicodeString(key_down, len(char), char)
+            Quartz.CGEventKeyboardSetUnicodeString(key_up, len(char), char)
+            CGEventPost(kCGHIDEventTap, key_down)
+            CGEventPost(kCGHIDEventTap, key_up)
+            time.sleep(0.003)  # small delay between chars for reliability
 
     def simulate_paste(self):
         source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)

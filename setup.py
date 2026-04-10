@@ -30,6 +30,7 @@ OPTIONS = {
         'CFBundleShortVersionString': '2.0',
         'LSUIElement': False,
         'NSMicrophoneUsageDescription': 'Say the word... needs microphone access to record your voice for transcription.',
+        'NSMainNibFile': '',  # no nib — UI is built programmatically
     },
     'packages': ['numpy', 'sounddevice'],
     'includes': [
