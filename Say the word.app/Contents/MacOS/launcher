@@ -4,7 +4,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 # Find Python 3 with PyObjC installed
 # Try Homebrew python3 first (any version), then system python3
 PYTHON=""
-for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$(which python3 2>/dev/null)"; do
+for candidate in /opt/homebrew/bin/python3 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.13 /usr/local/bin/python3 "$(which python3 2>/dev/null)"; do
+    [ -z "$candidate" ] && continue
     if [ -x "$candidate" ] && "$candidate" -c "import AppKit" 2>/dev/null; then
         PYTHON="$candidate"
         break
