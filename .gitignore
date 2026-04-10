@@ -5,3 +5,6 @@ __pycache__/
 voice.log
 voice-launchd.log
 .voice_app.pid
+dist/
+build/
+*.egg-info/

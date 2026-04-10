@@ -68,18 +68,104 @@ if os.path.exists(NDOT_FONT_PATH):
 # ── Config ──────────────────────────────────────────────────────────────
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
-with open(CONFIG_PATH) as f:
-    CONFIG = json.load(f)
+try:
+    with open(CONFIG_PATH) as f:
+        CONFIG = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError) as e:
+    print(f"Warning: Could not load {CONFIG_PATH} ({e}), using defaults")
+    CONFIG = {"languages": ["EN"], "whisper_codes": {"EN": "en"}, "hint_words": []}
 
-LANG_LABELS = CONFIG["languages"]                # e.g. ["EN", "DA"] or ["EN", "SE"]
-WHISPER_CODES = CONFIG.get("whisper_codes", {})   # e.g. {"EN": "en", "DA": "da", "SE": "sv"}
+LANG_LABELS = CONFIG.get("languages", ["EN"])
+WHISPER_CODES = CONFIG.get("whisper_codes", {"EN": "en"})
 HINT_WORDS = CONFIG.get("hint_words", [])
 
-MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "ggml-small.bin")
-WHISPER_CMD = (
-    subprocess.run(["which", "whisper-cli"], capture_output=True, text=True).stdout.strip()
-    or "/opt/homebrew/bin/whisper-cli"
-)
+# Store models in ~/Library/Application Support so they persist across app updates
+_APP_SUPPORT = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Say the word")
+_MODELS_DIR = os.path.join(_APP_SUPPORT, "models")
+# Also check the script directory for backwards compatibility (dev mode)
+_DEV_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "ggml-small.bin")
+MODEL_PATH = _DEV_MODEL_PATH if os.path.exists(_DEV_MODEL_PATH) else os.path.join(_MODELS_DIR, "ggml-small.bin")
+MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+
+def _find_whisper_cli():
+    """Find whisper-cli, checking common locations."""
+    result = subprocess.run(["which", "whisper-cli"], capture_output=True, text=True)
+    if result.stdout.strip():
+        return result.stdout.strip()
+    for path in ["/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"]:
+        if os.path.exists(path):
+            return path
+    return None
+
+WHISPER_CMD = _find_whisper_cli()
+
+def _first_run_setup():
+    """Check dependencies and download model on first run. Returns True if ready."""
+    global WHISPER_CMD, MODEL_PATH
+    ready = True
+
+    # Check for Homebrew
+    has_brew = subprocess.run(["which", "brew"], capture_output=True).returncode == 0
+
+    # Check / install whisper-cli
+    if not WHISPER_CMD:
+        if has_brew:
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'display dialog "Say the word... needs to install whisper-cli (speech engine).\n\nThis is a one-time setup." '
+                 'buttons {"Cancel", "Install"} default button "Install" with title "First Run Setup"'],
+                capture_output=True, text=True,
+            )
+            if "Install" in result.stdout:
+                # Install in Terminal so user can see progress
+                subprocess.run([
+                    "osascript", "-e",
+                    'tell application "Terminal" to do script "brew install whisper-cpp && echo Done — you can close this window"'
+                ], capture_output=True)
+                subprocess.run([
+                    "osascript", "-e",
+                    'display dialog "Installing whisper-cli in Terminal.\n\nReopen this app when it finishes." '
+                    'buttons {"OK"} default button "OK" with title "Installing..."'
+                ], capture_output=True)
+                sys.exit(0)
+            else:
+                sys.exit(0)
+        else:
+            subprocess.run([
+                "osascript", "-e",
+                'display alert "Say the word..." message "Homebrew and whisper-cli are required.\n\n'
+                'Install Homebrew first:\n/bin/bash -c \\"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\\"\n\n'
+                'Then: brew install whisper-cpp" as critical'
+            ], capture_output=True)
+            sys.exit(1)
+
+    # Download whisper model if missing
+    if not os.path.exists(MODEL_PATH):
+        result = subprocess.run(
+            ["osascript", "-e",
+             'display dialog "Say the word... needs to download the speech model (465 MB).\n\nThis is a one-time download." '
+             'buttons {"Cancel", "Download"} default button "Download" with title "First Run Setup"'],
+            capture_output=True, text=True,
+        )
+        if "Download" not in result.stdout:
+            sys.exit(0)
+
+        # Use Application Support for downloaded models
+        MODEL_PATH = os.path.join(_MODELS_DIR, "ggml-small.bin")
+        os.makedirs(_MODELS_DIR, exist_ok=True)
+        print("Downloading whisper model...")
+        dl_result = subprocess.run(
+            ["curl", "-L", "--progress-bar", "-o", MODEL_PATH, MODEL_URL],
+            timeout=600,
+        )
+        if dl_result.returncode != 0 or not os.path.exists(MODEL_PATH):
+            subprocess.run([
+                "osascript", "-e",
+                'display alert "Download failed" message "Could not download the speech model. Check your internet connection and try again." as critical'
+            ], capture_output=True)
+            sys.exit(1)
+
+    return True
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FN_FLAG = 1 << 23
@@ -89,7 +175,7 @@ WIN_WIDTH = 300
 WIN_HEIGHT = 290
 MINI_WIDTH = 220
 MINI_HEIGHT = 42
-CORNER_RADIUS = 26
+CORNER_RADIUS = 36
 
 # ── Color palette (neutral frosted glass — original style) ─────────────
 # Card background tint — very subtle warm-neutral
@@ -104,7 +190,12 @@ TEXT_SECONDARY = (1.0, 1.0, 1.0, 0.45)      # muted white
 BTN_R, BTN_G, BTN_B, BTN_A = 0.15, 0.17, 0.20, 0.85
 
 # ── Logging ─────────────────────────────────────────────────────────────
-LOG_PATH = os.path.join(SCRIPT_DIR, "voice.log")
+# Use Application Support for logs when running as bundled app
+if getattr(sys, 'frozen', False):
+    os.makedirs(_APP_SUPPORT, exist_ok=True)
+    LOG_PATH = os.path.join(_APP_SUPPORT, "voice.log")
+else:
+    LOG_PATH = os.path.join(SCRIPT_DIR, "voice.log")
 logging.basicConfig(filename=LOG_PATH, level=logging.DEBUG,
                     format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -203,6 +294,7 @@ class DotTextView(NSView):
         self._max_scatter = 80.0     # max pixels dots can scatter
         self._visible_dots = -1      # -1 = all visible, 0..N = how many to show
         self._dot_order = []         # randomized order for reveal/dissolve
+        self._visible_set = None     # precomputed set for O(1) lookups
         return self
 
     def setText_(self, text):
@@ -210,6 +302,7 @@ class DotTextView(NSView):
         self._build_attr_str()
         self._extract_dots_per_letter()
         self._visible_dots = -1  # all visible
+        self._visible_set = None
         import random
         self._dot_order = list(range(len(self._dots)))
         random.shuffle(self._dot_order)
@@ -226,16 +319,17 @@ class DotTextView(NSView):
         self._dot_order = list(range(total))
         random.shuffle(self._dot_order)
         self._visible_dots = total
+        self._rebuild_visible_set()
 
         def _run():
             # Remove dots in batches for speed
-            batch = max(1, total // 15)  # ~15 steps
+            batch = max(1, total // 8)  # ~8 steps
             while self._visible_dots > 0:
                 self._visible_dots = max(0, self._visible_dots - batch)
+                self._rebuild_visible_set()
                 def _r(): self.setNeedsDisplay_(True)
-                self.window().contentView().window().contentView()  # force
                 AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(_r)
-                time.sleep(0.02)
+                time.sleep(0.015)
             if callback:
                 AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(callback)
         threading.Thread(target=_run, daemon=True).start()
@@ -249,15 +343,18 @@ class DotTextView(NSView):
         self._dot_order = list(range(total))
         random.shuffle(self._dot_order)
         self._visible_dots = 0
+        self._rebuild_visible_set()
 
         def _run():
-            batch = max(1, total // 15)
+            batch = max(1, total // 8)
             while self._visible_dots < total:
                 self._visible_dots = min(total, self._visible_dots + batch)
+                self._rebuild_visible_set()
                 def _r(): self.setNeedsDisplay_(True)
                 AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(_r)
-                time.sleep(0.02)
+                time.sleep(0.015)
             self._visible_dots = -1  # all visible
+            self._visible_set = None
             def _r(): self.setNeedsDisplay_(True)
             AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(_r)
         threading.Thread(target=_run, daemon=True).start()
@@ -434,18 +531,20 @@ class DotTextView(NSView):
         self._target_spread = 0.0
         logging.info(f"DotTextView: extracted {len(self._dots)} dots from '{self._text}' ({len(self._text)} chars)")
 
+    def _rebuild_visible_set(self):
+        """Rebuild the set of visible dot indices from _dot_order and _visible_dots."""
+        if self._visible_dots == -1 or not self._dot_order:
+            self._visible_set = None
+        else:
+            self._visible_set = set(self._dot_order[:self._visible_dots])
+
     def _is_dot_visible(self, i):
         """Check if dot at index i should be drawn during dissolve/reveal."""
         if self._visible_dots == -1:
             return True  # all visible
-        if not self._dot_order:
+        if self._visible_set is None:
             return i < self._visible_dots
-        # _dot_order maps draw priority: first N in _dot_order are visible
-        try:
-            rank = self._dot_order.index(i)
-        except ValueError:
-            return True
-        return rank < self._visible_dots
+        return i in self._visible_set
 
     def drawRect_(self, rect):
         if self._visible_dots == 0:
@@ -514,28 +613,199 @@ class ClickableLabel(NSTextField):
         self.addCursorRect_cursor_(self.bounds(), AppKit.NSCursor.pointingHandCursor())
 
 
-# ── Language toggle (single click area, sliding indicator) ─────────────
-class LangToggleView(NSView):
+# ── All Whisper-supported languages ────────────────────────────────────
+WHISPER_LANGUAGES = [
+    ("auto", "Auto-detect"), ("af", "Afrikaans"), ("am", "Amharic"), ("ar", "Arabic"),
+    ("as", "Assamese"), ("az", "Azerbaijani"), ("ba", "Bashkir"), ("be", "Belarusian"),
+    ("bg", "Bulgarian"), ("bn", "Bengali"), ("bo", "Tibetan"), ("br", "Breton"),
+    ("bs", "Bosnian"), ("ca", "Catalan"), ("cs", "Czech"), ("cy", "Welsh"),
+    ("da", "Danish"), ("de", "German"), ("el", "Greek"), ("en", "English"),
+    ("es", "Spanish"), ("et", "Estonian"), ("eu", "Basque"), ("fa", "Persian"),
+    ("fi", "Finnish"), ("fo", "Faroese"), ("fr", "French"), ("gl", "Galician"),
+    ("gu", "Gujarati"), ("ha", "Hausa"), ("haw", "Hawaiian"), ("he", "Hebrew"),
+    ("hi", "Hindi"), ("hr", "Croatian"), ("ht", "Haitian Creole"), ("hu", "Hungarian"),
+    ("hy", "Armenian"), ("id", "Indonesian"), ("is", "Icelandic"), ("it", "Italian"),
+    ("ja", "Japanese"), ("jw", "Javanese"), ("ka", "Georgian"), ("kk", "Kazakh"),
+    ("km", "Khmer"), ("kn", "Kannada"), ("ko", "Korean"), ("la", "Latin"),
+    ("lb", "Luxembourgish"), ("ln", "Lingala"), ("lo", "Lao"), ("lt", "Lithuanian"),
+    ("lv", "Latvian"), ("mg", "Malagasy"), ("mi", "Maori"), ("mk", "Macedonian"),
+    ("ml", "Malayalam"), ("mn", "Mongolian"), ("mr", "Marathi"), ("ms", "Malay"),
+    ("mt", "Maltese"), ("my", "Myanmar"), ("ne", "Nepali"), ("nl", "Dutch"),
+    ("nn", "Nynorsk"), ("no", "Norwegian"), ("oc", "Occitan"), ("pa", "Punjabi"),
+    ("pl", "Polish"), ("ps", "Pashto"), ("pt", "Portuguese"), ("ro", "Romanian"),
+    ("ru", "Russian"), ("sa", "Sanskrit"), ("sd", "Sindhi"), ("si", "Sinhala"),
+    ("sk", "Slovak"), ("sl", "Slovenian"), ("sn", "Shona"), ("so", "Somali"),
+    ("sq", "Albanian"), ("sr", "Serbian"), ("su", "Sundanese"), ("sv", "Swedish"),
+    ("sw", "Swahili"), ("ta", "Tamil"), ("te", "Telugu"), ("tg", "Tajik"),
+    ("th", "Thai"), ("tk", "Turkmen"), ("tl", "Tagalog"), ("tr", "Turkish"),
+    ("tt", "Tatar"), ("uk", "Ukrainian"), ("ur", "Urdu"), ("uz", "Uzbek"),
+    ("vi", "Vietnamese"), ("yi", "Yiddish"), ("yo", "Yoruba"), ("yue", "Cantonese"),
+    ("zh", "Chinese"),
+]
+
+# ── Language dropdown (clickable pill → popup menu) ────────────────────
+class LangDropdownView(NSView):
     def initWithFrame_(self, frame):
-        self = objc.super(LangToggleView, self).initWithFrame_(frame)
+        self = objc.super(LangDropdownView, self).initWithFrame_(frame)
         if self is None:
             return None
-        self._selected = 0
-        self._labels = LANG_LABELS
+        self._selected_code = "en"
+        self._selected_name = "English"
         self._callback = None
         return self
 
     def setCallback_(self, cb):
         self._callback = cb
 
-    def selectedIndex(self):
-        return self._selected
+    def setLanguage_code_(self, name, code):
+        self._selected_name = name
+        self._selected_code = code
+        self.setNeedsDisplay_(True)
 
     def mouseDown_(self, event):
-        self._selected = 1 - self._selected
-        self.setNeedsDisplay_(True)
-        if self._callback:
-            self._callback(self._selected)
+        # Toggle popup
+        if hasattr(self, '_popup_window') and self._popup_window and self._popup_window.isVisible():
+            self._popup_window.orderOut_(None)
+            return
+        self._open_popup()
+
+    def _open_popup(self):
+        # Position below the pill
+        pill_screen = self.window().convertRectToScreen_(
+            self.convertRect_toView_(self.bounds(), None)
+        )
+        popup_w = 150
+        popup_h = 280
+        popup_x = pill_screen.origin.x + (pill_screen.size.width - popup_w) / 2
+        popup_y = pill_screen.origin.y - popup_h - 4
+
+        popup = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(popup_x, popup_y, popup_w, popup_h),
+            AppKit.NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        popup.setLevel_(NSFloatingWindowLevel + 1)
+        popup.setOpaque_(False)
+        popup.setBackgroundColor_(NSColor.clearColor())
+        popup.setHasShadow_(True)
+
+        content = popup.contentView()
+        content.setWantsLayer_(True)
+        content.layer().setCornerRadius_(14)
+        content.layer().setMasksToBounds_(True)
+
+        # Dark background
+        tint = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, popup_w, popup_h))
+        tint.setWantsLayer_(True)
+        tint.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.25).CGColor()
+        )
+        content.addSubview_(tint)
+
+        # Blur
+        blur = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, popup_w, popup_h))
+        blur.setMaterial_(13)
+        blur.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        blur.setState_(1)
+        blur.setAlphaValue_(0.7)
+        blur.setWantsLayer_(True)
+        blur.layer().setCornerRadius_(14)
+        blur.layer().setMasksToBounds_(True)
+        content.addSubview_(blur)
+
+        # Scroll view
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, popup_w, popup_h)
+        )
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setBorderType_(0)
+        scroller = scroll.verticalScroller()
+        if scroller:
+            scroller.setAlphaValue_(0.3)
+
+        row_h = 26
+        total_h = len(WHISPER_LANGUAGES) * row_h
+        doc = AppKit.NSFlippedView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, popup_w, max(total_h, popup_h))
+        )
+
+        # Keep strong refs to all rows
+        self._popup_rows = []
+        for idx, (code, name) in enumerate(WHISPER_LANGUAGES):
+            y = idx * row_h
+            btn = AppKit.NSButton.alloc().initWithFrame_(
+                NSMakeRect(4, y, popup_w - 8, row_h)
+            )
+            btn.setBezelStyle_(0)  # NSBezelStyleInline = 0 doesn't exist, use borderless
+            btn.setBordered_(False)
+            btn.setWantsLayer_(True)
+            btn.layer().setCornerRadius_(8)
+
+            # Attributed title
+            is_sel = (code == self._selected_code)
+            weight = NSFontWeightSemibold if is_sel else NSFontWeightRegular
+            color = NSColor.whiteColor() if is_sel else \
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.65)
+            font = NSFont.systemFontOfSize_weight_(11, weight)
+            prefix = "✓ " if is_sel else "  "
+            attrs = {
+                AppKit.NSFontAttributeName: font,
+                AppKit.NSForegroundColorAttributeName: color,
+            }
+            title = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                prefix + name.upper(), attrs
+            )
+            btn.setAttributedTitle_(title)
+            btn.setAlignment_(NSCenterTextAlignment)
+            btn.setTag_(idx)
+            btn.setTarget_(self)
+            btn.setAction_(objc.selector(self.langBtnClicked_, signature=b'v@:@'))
+            doc.addSubview_(btn)
+            self._popup_rows.append(btn)
+
+        scroll.setDocumentView_(doc)
+
+        # Scroll to selected
+        for idx, (code, _) in enumerate(WHISPER_LANGUAGES):
+            if code == self._selected_code:
+                target_y = idx * row_h - popup_h / 2 + row_h
+                doc.scrollPoint_(AppKit.NSMakePoint(0, max(0, target_y)))
+                break
+
+        content.addSubview_(scroll)
+
+        # Store strong refs
+        self._popup_window = popup
+        self._popup_tint = tint
+        self._popup_blur = blur
+        self._popup_scroll = scroll
+        self._popup_doc = doc
+
+        # Make parent window the popup's parent so it closes with it
+        self.window().addChildWindow_ordered_(popup, AppKit.NSWindowAbove)
+        popup.makeKeyAndOrderFront_(None)
+
+    def langBtnClicked_(self, sender):
+        idx = sender.tag()
+        if 0 <= idx < len(WHISPER_LANGUAGES):
+            code, name = WHISPER_LANGUAGES[idx]
+            self._selected_code = code
+            self._selected_name = name
+            self.setNeedsDisplay_(True)
+            if self._callback:
+                self._callback(code)
+        # Close popup on next run loop tick to avoid use-after-free
+        def _close():
+            if self._popup_window:
+                self.window().removeChildWindow_(self._popup_window)
+                self._popup_window.orderOut_(None)
+                self._popup_window = None
+                self._popup_rows = None
+        AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(_close)
+
+    langBtnClicked_ = objc.selector(langBtnClicked_, signature=b'v@:@')
 
     def resetCursorRects(self):
         self.addCursorRect_cursor_(self.bounds(), AppKit.NSCursor.pointingHandCursor())
@@ -544,40 +814,36 @@ class LangToggleView(NSView):
         bounds = self.bounds()
         w = bounds.size.width
         h = bounds.size.height
-        half_w = w / 2
         r = h / 2
 
-        # Track background
+        # Pill background
         track = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, r, r)
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.10).setFill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.25).setFill()
         track.fill()
 
-        # Sliding indicator pill
-        pad = 2
-        pill_w = half_w - pad
-        pill_h = h - pad * 2
-        pill_x = pad + self._selected * (half_w)
-        pill_r = pill_h / 2
-        pill_rect = NSMakeRect(pill_x, pad, pill_w, pill_h)
-        pill = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(pill_rect, pill_r, pill_r)
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.22).setFill()
-        pill.fill()
+        # Language name + arrow — centered together
+        label = f"{self._selected_name.upper()} ▾"
+        font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
+        color = NSColor.whiteColor()
+        attrs = {
+            AppKit.NSFontAttributeName: font,
+            AppKit.NSForegroundColorAttributeName: color,
+        }
+        attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(label, attrs)
+        size = attr_str.size()
+        x = (w - size.width) / 2
+        y = (h - size.height) / 2
+        attr_str.drawAtPoint_(AppKit.NSMakePoint(x, y))
 
-        # Labels
-        for i, label in enumerate(self._labels):
-            is_active = (i == self._selected)
-            color = NSColor.whiteColor() if is_active else NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.45)
-            font = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold if is_active else NSFontWeightRegular)
-            attrs = {
-                AppKit.NSFontAttributeName: font,
-                AppKit.NSForegroundColorAttributeName: color,
-            }
-            attr_str = AppKit.NSAttributedString.alloc().initWithString_attributes_(label, attrs)
-            size = attr_str.size()
-            x = i * half_w + (half_w - size.width) / 2
-            y = (h - size.height) / 2
-            attr_str.drawAtPoint_(AppKit.NSMakePoint(x, y))
 
+
+# ── Flipped view (for top-to-bottom layout in scroll views) ────────────
+class _FlippedView(NSView):
+    def isFlipped(self):
+        return True
+
+# Register as NSFlippedView for use in the dropdown
+AppKit.NSFlippedView = _FlippedView
 
 # ── Hands-Free toggle (single on/off button) ────────────────────────────
 class HandsFreeToggleView(NSView):
@@ -616,17 +882,14 @@ class HandsFreeToggleView(NSView):
 
         # Track background
         track = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, r, r)
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.10).setFill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.25).setFill()
         track.fill()
 
         if self._active:
-            pad = 2
-            pill_rect = NSMakeRect(pad, pad, w - pad * 2, h - pad * 2)
-            pill_r = (h - pad * 2) / 2
             pill = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                pill_rect, pill_r, pill_r
+                bounds, r, r
             )
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.22).setFill()
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.35).setFill()
             pill.fill()
 
         label = "● HANDS-FREE" if self._active else "HANDS-FREE"
@@ -677,13 +940,13 @@ class MiniToggleView(NSView):
         pill = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             bounds, h / 2, h / 2
         )
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.12).setFill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.35).setFill()
         pill.fill()
 
         # Draw collapse/expand icon (two horizontal lines for collapse, expand arrows)
-        icon = "▾" if not self._is_mini else "▴"
+        icon = "▴" if not self._is_mini else "▾"
         font = NSFont.systemFontOfSize_weight_(10, NSFontWeightMedium)
-        color = NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.6)
+        color = NSColor.whiteColor() if self._is_mini else NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.6)
         attrs = {
             AppKit.NSFontAttributeName: font,
             AppKit.NSForegroundColorAttributeName: color,
@@ -706,6 +969,7 @@ class VoiceToTextApp:
         self._stop_clap_monitor = threading.Event()
         self._is_mini = False
         self._animating_waveform = False
+        self._mini_lock = threading.Lock()
 
         self.app = NSApplication.sharedApplication()
         self.app.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
@@ -767,8 +1031,8 @@ class VoiceToTextApp:
 
     def build_window(self):
         screen = AppKit.NSScreen.mainScreen().frame()
-        x = screen.size.width - WIN_WIDTH - 20
-        y = screen.size.height - WIN_HEIGHT - 60
+        x = (screen.size.width - WIN_WIDTH) / 2  # top-center
+        y = screen.size.height - WIN_HEIGHT - 40
 
         style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView)
@@ -781,7 +1045,7 @@ class VoiceToTextApp:
         )
 
         self.window.setLevel_(NSFloatingWindowLevel)
-        self.window.setTitle_("Voice to Text")
+        self.window.setTitle_("Say the word...")
         self.window.setTitleVisibility_(1)  # NSWindowTitleHidden
         self.window.setTitlebarAppearsTransparent_(True)
         self.window.setMovableByWindowBackground_(True)
@@ -800,12 +1064,14 @@ class VoiceToTextApp:
         content = self.window.contentView()
         content.setWantsLayer_(True)
         content.layer().setCornerRadius_(CORNER_RADIUS)
+        content.layer().setCornerCurve_("continuous")  # squircle
         content.layer().setMasksToBounds_(True)
 
-        # Base tint — muted blue-grey fill
+        # Base tint
         tint_view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT))
         tint_view.setWantsLayer_(True)
         tint_view.layer().setCornerRadius_(CORNER_RADIUS)
+        tint_view.layer().setCornerCurve_("continuous")
         tint_view.layer().setMasksToBounds_(True)
         tint_view.layer().setBackgroundColor_(
             NSColor.colorWithCalibratedRed_green_blue_alpha_(BG_R, BG_G, BG_B, BG_ALPHA).CGColor()
@@ -813,16 +1079,17 @@ class VoiceToTextApp:
         content.addSubview_(tint_view)
         self._tint_view = tint_view
 
-        # Frosted blur — softer with blue-grey tint
+        # Frosted blur
         vibrancy = NSVisualEffectView.alloc().initWithFrame_(
             NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT)
         )
-        vibrancy.setMaterial_(13)  # NSVisualEffectMaterialHUDWindow
+        vibrancy.setMaterial_(13)
         vibrancy.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         vibrancy.setState_(1)
         vibrancy.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         vibrancy.setWantsLayer_(True)
         vibrancy.layer().setCornerRadius_(CORNER_RADIUS)
+        vibrancy.layer().setCornerCurve_("continuous")
         vibrancy.layer().setMasksToBounds_(True)
         vibrancy.setAlphaValue_(0.75)
         content.addSubview_(vibrancy)
@@ -858,13 +1125,14 @@ class VoiceToTextApp:
         highlight_view.layer().addSublayer_(specular)
         content.addSubview_(highlight_view)
         self._highlight_view = highlight_view
+        self._specular = specular
 
         # ── Ndot headline ──
         # dot_text covers full window so scattered dots can fly behind other views
         self.dot_text = DotTextView.alloc().initWithFrame_(
             NSMakeRect(0, 0, WIN_WIDTH, WIN_HEIGHT)
         )
-        self.dot_text._text_y_center = 200  # upper portion of window
+        self.dot_text._text_y_center = 203  # upper portion of window
         self.dot_text.setText_("Say the word...")
         content.addSubview_(self.dot_text)
 
@@ -884,13 +1152,13 @@ class VoiceToTextApp:
         )
         content.addSubview_(self.status_label)
 
-        # ── Language toggle ──
+        # ── Language dropdown ──
         tog_w = 112
         tog_h = 26
-        self.lang_toggle = LangToggleView.alloc().initWithFrame_(
+        self.lang_toggle = LangDropdownView.alloc().initWithFrame_(
             NSMakeRect((WIN_WIDTH - tog_w) / 2, 126, tog_w, tog_h)
         )
-        self.lang_toggle.setCallback_(self._on_lang_toggle)
+        self.lang_toggle.setCallback_(self._on_lang_select)
         content.addSubview_(self.lang_toggle)
 
         # ── Hands-Free toggle ──
@@ -944,82 +1212,117 @@ class VoiceToTextApp:
 
         self.window.makeKeyAndOrderFront_(None)
 
+    def _update_highlight_edge(self, w, h, radius):
+        """Rebuild the specular highlight mask for a given size and corner radius."""
+        from Quartz import CAShapeLayer
+        self._specular.setFrame_(Quartz.CGRectMake(0, 0, w, h))
+        mask = CAShapeLayer.alloc().init()
+        path = Quartz.CGPathCreateWithRoundedRect(
+            Quartz.CGRectMake(0.5, 0.5, w - 1, h - 1), radius, radius, None
+        )
+        mask.setPath_(path)
+        mask.setFillColor_(None)
+        mask.setStrokeColor_(NSColor.whiteColor().CGColor())
+        mask.setLineWidth_(1.0)
+        self._specular.setMask_(mask)
+
     def _toggle_mini_mode(self):
+        if not self._mini_lock.acquire(blocking=False):
+            return  # already animating, ignore
         self._is_mini = not self._is_mini
         self.mini_toggle.setMini_(self._is_mini)
 
         frame = self.window.frame()
-        ANIM_DURATION = 0.3
+        ANIM_DURATION = 0.18
 
         if self._is_mini:
-            # ── Collapse to mini pill ──
+            # ── Collapse to mini pill — always top-center ──
+            screen = AppKit.NSScreen.mainScreen().frame()
             new_w = MINI_WIDTH
             new_h = MINI_HEIGHT
-            new_x = frame.origin.x + (frame.size.width - new_w)
-            new_y = frame.origin.y + (frame.size.height - new_h)
+            new_x = (screen.size.width - new_w) / 2
+            new_y = screen.size.height - new_h - 40
 
-            # Fade out other views quickly
-            AppKit.NSAnimationContext.beginGrouping()
-            AppKit.NSAnimationContext.currentContext().setDuration_(ANIM_DURATION * 0.3)
-            for v in self._full_mode_views:
-                v.animator().setAlphaValue_(0.0)
-            AppKit.NSAnimationContext.endGrouping()
-
-            # Dissolve dots one by one, then resize window, then reveal in mini
             def _do_collapse():
-                self.dot_text.dissolve(callback=None)
-                # Wait for dissolve to finish
-                while self.dot_text._visible_dots > 0:
+              try:
+                # Dissolve dots + fade out other views simultaneously
+                def _start():
+                    AppKit.NSAnimationContext.beginGrouping()
+                    AppKit.NSAnimationContext.currentContext().setDuration_(0.25)
+                    for v in self._full_mode_views:
+                        v.animator().setAlphaValue_(0.0)
+                    AppKit.NSAnimationContext.endGrouping()
+                self.on_main(_start)
+                self.dot_text.dissolve()
+                deadline = time.time() + 1.0
+                while self.dot_text._visible_dots > 0 and time.time() < deadline:
                     time.sleep(0.01)
 
+                # Start resize — hide highlight during transition
                 def _resize():
+                    self._highlight_view.setHidden_(True)
                     for v in self._full_mode_views:
                         v.setHidden_(True)
                         v.setAlphaValue_(1.0)
 
-                    # Resize window
+                    self.window.contentView().layer().setCornerRadius_(new_h / 2)
+                    self._tint_view.layer().setCornerRadius_(new_h / 2)
+                    self._vibrancy.layer().setCornerRadius_(new_h / 2)
+
                     AppKit.NSAnimationContext.beginGrouping()
                     AppKit.NSAnimationContext.currentContext().setDuration_(ANIM_DURATION)
                     self.window.animator().setFrame_display_(
                         NSMakeRect(new_x, new_y, new_w, new_h), True
                     )
                     self.mini_toggle.animator().setFrame_(NSMakeRect(
-                        new_w - 28, (new_h - 22) / 2, 22, 22
+                        new_w - 34, (new_h - 22) / 2, 22, 22
                     ))
                     AppKit.NSAnimationContext.endGrouping()
                 self.on_main(_resize)
-
                 time.sleep(ANIM_DURATION + 0.05)
 
-                def _reveal_mini():
-                    self.window.contentView().layer().setCornerRadius_(new_h / 2)
-                    self._tint_view.layer().setCornerRadius_(new_h / 2)
-                    self._vibrancy.layer().setCornerRadius_(new_h / 2)
-
+                # Reveal in mini — show highlight with new mask
+                def _reveal():
+                    self._update_highlight_edge(new_w, new_h, new_h / 2)
+                    self._highlight_view.setHidden_(False)
                     self.dot_text.setFrame_(NSMakeRect(*self._dot_text_mini_frame))
+                    self.dot_text._font_size = 18
+                    self.dot_text._font = NSFont.fontWithName_size_("Ndot 55", 18) or \
+                                           NSFont.fontWithName_size_("Ndot 57 Aligned", 18) or \
+                                           NSFont.systemFontOfSize_(18)
                     self.dot_text._text_y_center = None
                     self.dot_text.setText_(self._mini_text_for_state())
                     self.dot_text.reveal()
-                self.on_main(_reveal_mini)
+                self.on_main(_reveal)
+              finally:
+                self._mini_lock.release()
             threading.Thread(target=_do_collapse, daemon=True).start()
 
         else:
-            # ── Expand to full ──
+            # ── Expand to full — always top-center ──
+            screen = AppKit.NSScreen.mainScreen().frame()
             new_w = WIN_WIDTH
             new_h = WIN_HEIGHT
-            new_x = frame.origin.x + (frame.size.width - new_w)
-            new_y = frame.origin.y + (frame.size.height - new_h)
+            new_x = (screen.size.width - new_w) / 2
+            new_y = screen.size.height - new_h - 40
 
-            # Dissolve dots, then resize, then reveal
             def _do_expand():
-                self.dot_text.dissolve(callback=None)
-                while self.dot_text._visible_dots > 0:
+              try:
+                # Dissolve dots
+                self.dot_text.dissolve()
+                deadline = time.time() + 1.0
+                while self.dot_text._visible_dots > 0 and time.time() < deadline:
                     time.sleep(0.01)
 
+                # Resize — hide highlight during transition
                 def _resize():
+                    self._highlight_view.setHidden_(True)
                     self.window.contentView().layer().setCornerRadius_(CORNER_RADIUS)
+                    self.window.contentView().layer().setCornerCurve_("continuous")
                     self._tint_view.layer().setCornerRadius_(CORNER_RADIUS)
+                    self._tint_view.layer().setCornerCurve_("continuous")
                     self._vibrancy.layer().setCornerRadius_(CORNER_RADIUS)
+                    self._vibrancy.layer().setCornerCurve_("continuous")
 
                     for v in self._full_mode_views:
                         v.setAlphaValue_(0.0)
@@ -1035,22 +1338,29 @@ class VoiceToTextApp:
                     ))
                     AppKit.NSAnimationContext.endGrouping()
                 self.on_main(_resize)
-
                 time.sleep(ANIM_DURATION + 0.05)
 
-                def _reveal_full():
+                # Reveal in full — show highlight with new mask
+                def _reveal():
+                    self._update_highlight_edge(new_w, new_h, CORNER_RADIUS)
+                    self._highlight_view.setHidden_(False)
                     self.dot_text.setFrame_(NSMakeRect(*self._dot_text_full_frame))
-                    self.dot_text._text_y_center = 200
+                    self.dot_text._font_size = 24
+                    self.dot_text._font = NSFont.fontWithName_size_("Ndot 55", 24) or \
+                                           NSFont.fontWithName_size_("Ndot 57 Aligned", 24) or \
+                                           NSFont.systemFontOfSize_(24)
+                    self.dot_text._text_y_center = 203
                     self.dot_text.setText_(self._full_text_for_state())
                     self.dot_text.reveal()
 
-                    # Fade in other views
                     AppKit.NSAnimationContext.beginGrouping()
                     AppKit.NSAnimationContext.currentContext().setDuration_(0.2)
                     for v in self._full_mode_views:
                         v.animator().setAlphaValue_(1.0)
                     AppKit.NSAnimationContext.endGrouping()
-                self.on_main(_reveal_full)
+                self.on_main(_reveal)
+              finally:
+                self._mini_lock.release()
             threading.Thread(target=_do_expand, daemon=True).start()
 
     def _mini_text_for_state(self):
@@ -1083,9 +1393,8 @@ class VoiceToTextApp:
             label.setTextColor_(color)
         return label
 
-    def _on_lang_toggle(self, index):
-        label = LANG_LABELS[index]
-        self.language = WHISPER_CODES.get(label, label.lower())
+    def _on_lang_select(self, code):
+        self.language = code
         logging.info(f"Language switched to: {self.language}")
 
     def _on_hands_free_toggle(self, active):
@@ -1360,21 +1669,21 @@ class VoiceToTextApp:
                     tell application "{browser}"
                         repeat with w in windows
                             repeat with t in tabs of w
-                                set wasPlaying to execute t javascript "
+                                set isPlaying to execute t javascript "
                                     (function() {{
                                         var v = document.querySelectorAll('video, audio');
                                         var playing = false;
                                         v.forEach(function(el) {{
-                                            if (!el.paused) {{ playing = true; el.pause(); }}
+                                            if (!el.paused) {{ playing = true; }}
                                         }});
                                         return playing;
                                     }})()"
-                                if wasPlaying is "true" then return "paused"
+                                if isPlaying is "true" then return "playing"
                             end repeat
                         end repeat
                     end tell'''
                 r = subprocess.run(["osascript", "-e", js_check], capture_output=True, text=True, timeout=3)
-                if r.stdout.strip() == "paused":
+                if r.stdout.strip() == "playing":
                     sources.append(("browser", browser))
             except Exception:
                 pass
@@ -1389,25 +1698,33 @@ class VoiceToTextApp:
                     tell application "Safari"
                         repeat with w in windows
                             repeat with t in tabs of w
-                                set wasPlaying to do JavaScript "
+                                set isPlaying to do JavaScript "
                                     (function() {
                                         var v = document.querySelectorAll('video, audio');
                                         var playing = false;
                                         v.forEach(function(el) {
-                                            if (!el.paused) { playing = true; el.pause(); }
+                                            if (!el.paused) { playing = true; }
                                         });
                                         return playing;
                                     })()" in t
-                                if wasPlaying is "true" then return "paused"
+                                if isPlaying is "true" then return "playing"
                             end repeat
                         end repeat
                     end tell'''
                 r = subprocess.run(["osascript", "-e", js_check], capture_output=True, text=True, timeout=3)
-                if r.stdout.strip() == "paused":
+                if r.stdout.strip() == "playing":
                     sources.append(("browser", "Safari"))
         except Exception:
             pass
         return sources
+
+    def _pause_browser(self, browser):
+        """Pause audio/video in a specific browser."""
+        if browser == "Safari":
+            js = 'tell application "Safari" to repeat with w in windows\nrepeat with t in tabs of w\ndo JavaScript "document.querySelectorAll(\'video, audio\').forEach(function(el) { if (!el.paused) el.pause(); })" in t\nend repeat\nend repeat'
+        else:
+            js = f'tell application "{browser}" to repeat with w in windows\nrepeat with t in tabs of w\nexecute t javascript "document.querySelectorAll(\'video, audio\').forEach(function(el) {{ if (!el.paused) el.pause(); }})"\nend repeat\nend repeat'
+        subprocess.Popen(["osascript", "-e", js], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def pause_all_audio(self):
         sources = self.get_playing_sources()
@@ -1415,6 +1732,8 @@ class VoiceToTextApp:
             if kind == "app":
                 subprocess.Popen(["osascript", "-e", f'tell application "{name}" to pause'],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif kind == "browser":
+                self._pause_browser(name)
         return sources
 
     def resume_all_audio(self):
@@ -1441,6 +1760,11 @@ class VoiceToTextApp:
     def start_recording(self):
         try:
             logging.info("Fn pressed — recording")
+            # Stop clap monitor stream before opening recording stream
+            # to avoid two concurrent streams on the same mic
+            if self.hands_free_mode:
+                self._stop_clap_monitor.set()
+                time.sleep(0.05)  # let the clap stream close
             self.audio_frames = []
             self.recording = True
             self.stream = sd.InputStream(
@@ -1450,8 +1774,18 @@ class VoiceToTextApp:
             self.stream.start()
             self.set_state_recording()
             threading.Thread(target=self._pause_bg, daemon=True).start()
+        except sd.PortAudioError:
+            logging.exception("Microphone access denied or unavailable")
+            self.recording = False
+            def _warn():
+                self.dot_text.setText_("No mic")
+                self.status_label.setStringValue_(
+                    "Grant Microphone access in System Settings"
+                )
+            self.on_main(_warn)
         except Exception:
             logging.exception("Error starting recording")
+            self.recording = False
 
     def _pause_bg(self):
         self.paused_sources = self.pause_all_audio()
@@ -1528,9 +1862,9 @@ class VoiceToTextApp:
                 self.simulate_paste()
                 if self.hands_free_mode:
                     self.simulate_return()
-                    time.sleep(0.4)  # let paste + Return land before restoring
+                    time.sleep(0.8)  # let paste + Return land before restoring
                 else:
-                    time.sleep(0.15)
+                    time.sleep(0.5)  # give target app time to process paste
                 self._clipboard_restore(saved)
 
             finally:
@@ -1541,6 +1875,11 @@ class VoiceToTextApp:
         except Exception:
             logging.exception("Error in transcription")
             self.set_state_idle()
+        finally:
+            # Restart clap monitor if hands-free is still active
+            if self.hands_free_mode:
+                self._stop_clap_monitor.clear()
+                threading.Thread(target=self._clap_monitor, daemon=True).start()
 
     def _clipboard_save(self):
         pb = AppKit.NSPasteboard.generalPasteboard()
@@ -1608,7 +1947,13 @@ class VoiceToTextApp:
         )
 
         if tap is None:
-            logging.error("Could not create event tap")
+            logging.error("Could not create event tap — Accessibility permission missing")
+            def _warn():
+                self.dot_text.setText_("No access")
+                self.status_label.setStringValue_(
+                    "Grant Accessibility in System Settings"
+                )
+            self.on_main(_warn)
             return
 
         self._event_tap = tap  # prevent GC
@@ -1625,12 +1970,33 @@ class VoiceToTextApp:
 
 
 if __name__ == "__main__":
-    AppKit.NSProcessInfo.processInfo().setProcessName_("Voice to Text")
-    if not os.path.exists(MODEL_PATH):
-        logging.warning(f"Model not found at {MODEL_PATH} — transcription disabled")
-        print(f"Warning: Model not found at {MODEL_PATH} — UI will run but transcription won't work")
+    # Override the bundle info so macOS shows "Say the word..." in menu bar
+    bundle = AppKit.NSBundle.mainBundle()
+    info = bundle.infoDictionary()
+    info["CFBundleName"] = "Say the word..."
+    info["CFBundleDisplayName"] = "Say the word..."
 
-    # Kill any existing instances
+    AppKit.NSProcessInfo.processInfo().setProcessName_("Say the word...")
+
+    # Set menu bar
+    menubar = AppKit.NSMenu.alloc().init()
+    app_menu_item = AppKit.NSMenuItem.alloc().init()
+    menubar.addItem_(app_menu_item)
+    NSApplication.sharedApplication().setMainMenu_(menubar)
+    app_menu = AppKit.NSMenu.alloc().initWithTitle_("Say the word...")
+    quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Quit Voice to Text", "terminate:", "q"
+    )
+    app_menu.addItem_(quit_item)
+    app_menu_item.setSubmenu_(app_menu)
+
+    # First-run setup — install whisper-cli and download model if needed
+    _first_run_setup()
+    # Re-discover whisper-cli in case it was just installed
+    if not WHISPER_CMD:
+        WHISPER_CMD = _find_whisper_cli()
+
+    # Kill any existing instances — verify it's actually voice_app before killing
     import signal
     my_pid = os.getpid()
     pid_file = os.path.join(SCRIPT_DIR, ".voice_app.pid")
@@ -1638,8 +2004,14 @@ if __name__ == "__main__":
         try:
             old_pid = int(open(pid_file).read().strip())
             if old_pid != my_pid:
-                os.kill(old_pid, signal.SIGTERM)
-                time.sleep(0.5)
+                # Verify the PID is actually a voice_app process before killing
+                check = subprocess.run(
+                    ["ps", "-p", str(old_pid), "-o", "command="],
+                    capture_output=True, text=True,
+                )
+                if "voice_app" in check.stdout:
+                    os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(0.5)
         except (ProcessLookupError, ValueError):
             pass
     with open(pid_file, "w") as f:

@@ -1,65 +1,73 @@
-# Voice to Text
+# Say the word...
 
 A minimal, floating macOS app for voice-to-text. Hold the **Fn key** to record, release to transcribe and paste into any app.
 
-Built with Whisper (local, offline transcription) and a frosted-glass UI inspired by iOS/visionOS.
+Built with Whisper (local, offline transcription) and a frosted-glass UI inspired by visionOS.
 
 ## Features
 
-- **Hold Fn to record** — transcribed text is automatically pasted into the active app
-- **Language toggle** — switch between two languages with one click
-- **Hands-free mode** — double-clap to start/stop recording
-- **Audio pause/resume** — automatically pauses Spotify, Music, and browser audio while recording
-- **Transcription history** — click any previous transcription to copy it
+- **Hold Fn to record** -- transcribed text is automatically pasted into the active app
+- **40+ languages** -- full Whisper language support with searchable dropdown
+- **Hands-free mode** -- double-clap to start/stop recording
+- **Mini mode** -- collapse to a tiny pill that stays out of the way
+- **Audio pause/resume** -- automatically pauses Spotify, Music, and browser audio while recording
+- **Transcription history** -- click any previous transcription to copy it
+- **Dot-matrix animations** -- Ndot font with scatter/dissolve effects driven by your voice
 
-## Install
+## Download
+
+1. Go to [Releases](https://github.com/dl-jorgobe/voice-to-text/releases) and download the latest `.zip`
+2. Unzip and drag **Say the word...** to your Applications folder
+3. Open the app -- it will guide you through first-run setup
+
+## First-run setup
+
+On first launch, the app will:
+
+1. **Install whisper-cli** via Homebrew (if not already installed)
+2. **Download the Whisper model** (465 MB, one-time)
+
+You also need to grant two permissions in **System Settings > Privacy & Security**:
+
+- **Accessibility** -- so the app can detect the Fn key
+- **Microphone** -- so the app can record your voice
+
+And in **System Settings > Keyboard**, set "Press fn key to" to **Do Nothing**.
+
+## Build from source
+
+If you prefer to build it yourself:
 
 ```bash
 git clone https://github.com/dl-jorgobe/voice-to-text.git
 cd voice-to-text
 ./install.sh
+open "Say the word.app"
 ```
 
-The install script handles Homebrew, whisper-cli, Python packages, and the Whisper model download.
-
-## Setup
-
-Before using the app:
-
-1. **System Settings > Privacy & Security > Accessibility** — grant access to Voice to Text
-2. **System Settings > Keyboard** — set "Press fn key to" to **Do Nothing**
-
-## Launch
-
-Double-click `Voice to Text.app`, or:
+Or build a standalone `.app` bundle:
 
 ```bash
-open "Voice to Text.app"
+pip3 install py2app
+python3 setup.py py2app
+open "dist/Say the word....app"
 ```
 
 ## Configuration
 
-Edit `config.json` to set your languages and hint words:
+Edit `config.json` to set default languages and hint words:
 
 ```json
 {
   "languages": ["EN", "DA"],
-  "whisper_codes": {
-    "EN": "en",
-    "DA": "da",
-    "SE": "sv"
-  },
-  "hint_words": ["Jorgobé", "Søren", "skincare"]
+  "whisper_codes": { "EN": "en", "DA": "da" },
+  "hint_words": ["your", "custom", "words"]
 }
 ```
 
-- **languages** — the two labels shown in the toggle (e.g. `["EN", "SE"]` for English/Swedish)
-- **whisper_codes** — maps each label to the Whisper language code
-- **hint_words** — words Whisper should listen for (names, brands, jargon). Leave empty `[]` if not needed
+- **hint_words** -- words Whisper should prioritize (names, brands, jargon). Leave empty `[]` if not needed.
 
 ## Requirements
 
-- macOS
-- Homebrew
-- Python 3
-- whisper-cli (`brew install whisper-cpp`)
+- macOS (Apple Silicon or Intel)
+- Homebrew (installed automatically if missing)
