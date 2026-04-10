@@ -27,6 +27,9 @@ On first launch, the app will:
 1. **Install whisper-cli** via Homebrew (if not already installed)
 2. **Download the Whisper model** (465 MB, one-time)
 
+Since the app isn't signed with an Apple Developer ID, macOS will block it the first time. To open it:
+- **Right-click** the app and choose **Open**, then click **Open** in the dialog
+
 You also need to grant two permissions in **System Settings > Privacy & Security**:
 
 - **Accessibility** -- so the app can detect the Fn key
