@@ -69,7 +69,7 @@ if os.path.exists(NDOT_FONT_PATH):
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 try:
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         CONFIG = json.load(f)
 except (FileNotFoundError, json.JSONDecodeError) as e:
     print(f"Warning: Could not load {CONFIG_PATH} ({e}), using defaults")
