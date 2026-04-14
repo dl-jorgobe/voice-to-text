@@ -82,7 +82,7 @@ WHISPER_CODES = CONFIG.get("whisper_codes", {"EN": "en"})
 HINT_WORDS = CONFIG.get("hint_words", [])
 
 # Whisper confidently hallucinates these phrases on silent or near-silent audio.
-# Compared after lowercasing and stripping punctuation/whitespace.
+# Compared after lowercasing and stripping punctuation/whitespace (exact match).
 HALLUCINATION_PHRASES = {
     "", "you", "thank you", "thank you.", "thanks", "thanks.",
     "thanks for watching", "thanks for watching.", "thanks for watching!",
@@ -96,6 +96,26 @@ HALLUCINATION_PHRASES = {
     "tack", "tack.", "tack för att ni tittade",  # Swedish
     ".", "..", "...", "!", "?",
 }
+
+# Known training-data artifacts. If any of these appear anywhere in the
+# transcription, discard the whole thing. These come from ads, YouTube
+# tutorials, and subtitle credits that contaminated whisper's training set.
+HALLUCINATION_SUBSTRINGS = (
+    "beadaholique",
+    "amara.org",
+    "mooji.org",
+    "subs by the",
+    "subtitles by the",
+    "subtitled by",
+    "transcribed by",
+    "subscribe to my channel",
+    "subscribe to the channel",
+    "like and subscribe",
+    "don't forget to subscribe",
+    "ale rodriguez",
+    "mbc+",
+    ".com for all of your",
+)
 
 # Store models in ~/Library/Application Support so they persist across app updates
 _APP_SUPPORT = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Say the word")
@@ -1987,6 +2007,14 @@ wait $SAY_PID 2>/dev/null
                 normalized = re.sub(r'[^\w\s]', '', text.lower()).strip()
                 if normalized in HALLUCINATION_PHRASES:
                     logging.info(f"Filtered hallucination phrase: {text!r}")
+                    self.set_state_idle()
+                    self.resume_all_audio()
+                    return
+
+                # Training-data artifacts (ads, subtitle credits, YouTube spam).
+                lower = text.lower()
+                if any(s in lower for s in HALLUCINATION_SUBSTRINGS):
+                    logging.info(f"Filtered training-data hallucination: {text!r}")
                     self.set_state_idle()
                     self.resume_all_audio()
                     return
