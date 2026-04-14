@@ -7,6 +7,7 @@ Muted blue-grey card UI with Ndot dot-matrix text animation.
 
 import os
 import sys
+import re
 import json
 import wave
 import tempfile
@@ -1950,7 +1951,11 @@ wait $SAY_PID 2>/dev/null
 
                 logging.info(f"whisper stdout: {result.stdout!r}")
 
-                text = result.stdout.strip().strip("[] \n")
+                raw = result.stdout.strip()
+                # Strip whisper non-speech tags like [Music], [Sounds of people talking],
+                # [BLANK_AUDIO], *foreign language*, <noise>. These describe audio, not words.
+                stripped = re.sub(r'\[[^\]\n]*\]|\*[^*\n]*\*|<[^>\n]*>', '', raw)
+                text = re.sub(r'\s+', ' ', stripped).strip(" .,\n")
 
                 PROMPT_WORDS = {w.lower() for w in HINT_WORDS} if HINT_WORDS else set()
                 text_words = set(text.lower().replace(",", "").replace(".", "").split())
@@ -1961,7 +1966,7 @@ wait $SAY_PID 2>/dev/null
                     return
 
                 if not text or text.lower() in ("(blank audio)", "[blank_audio]", ""):
-                    logging.info("No speech detected")
+                    logging.info(f"No speech detected (raw={raw!r})")
                     self.set_state_idle()
                     self.resume_all_audio()
                     return
@@ -2046,18 +2051,38 @@ wait $SAY_PID 2>/dev/null
     def setup_event_tap(self):
         fn_held = False
         app_ref = self
+        # Quartz constants; fall back to Apple header values if not exposed
+        tap_disabled_timeout = getattr(Quartz, "kCGEventTapDisabledByTimeout", 0xFFFFFFFE)
+        tap_disabled_user = getattr(Quartz, "kCGEventTapDisabledByUserInput", 0xFFFFFFFF)
 
         def callback(proxy, event_type, event, refcon):
             nonlocal fn_held
-            flags = CGEventGetFlags(event)
-            fn_now = bool(flags & FN_FLAG)
 
-            if fn_now and not fn_held:
-                fn_held = True
-                app_ref.start_recording()
-            elif not fn_now and fn_held:
-                fn_held = False
-                threading.Thread(target=app_ref.stop_and_transcribe, daemon=True).start()
+            # macOS disables the tap if a callback ever runs too long, or on
+            # certain user-input events. Without this, the hotkey silently
+            # dies and the app appears to crash. Re-enable and continue.
+            if event_type in (tap_disabled_timeout, tap_disabled_user):
+                logging.warning(f"Event tap disabled (type={event_type}); re-enabling")
+                try:
+                    Quartz.CGEventTapEnable(app_ref._event_tap, True)
+                except Exception:
+                    logging.exception("Failed to re-enable event tap")
+                return event
+
+            try:
+                flags = CGEventGetFlags(event)
+                fn_now = bool(flags & FN_FLAG)
+
+                if fn_now and not fn_held:
+                    fn_held = True
+                    # Run off the callback thread so the tap stays responsive
+                    # and macOS never times it out.
+                    threading.Thread(target=app_ref.start_recording, daemon=True).start()
+                elif not fn_now and fn_held:
+                    fn_held = False
+                    threading.Thread(target=app_ref.stop_and_transcribe, daemon=True).start()
+            except Exception:
+                logging.exception("Event tap callback error")
 
             return event
 
