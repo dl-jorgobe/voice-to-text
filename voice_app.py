@@ -10,6 +10,7 @@ import sys
 import re
 import json
 import wave
+import queue
 import tempfile
 import subprocess
 import threading
@@ -79,6 +80,22 @@ except (FileNotFoundError, json.JSONDecodeError) as e:
 LANG_LABELS = CONFIG.get("languages", ["EN"])
 WHISPER_CODES = CONFIG.get("whisper_codes", {"EN": "en"})
 HINT_WORDS = CONFIG.get("hint_words", [])
+
+# Whisper confidently hallucinates these phrases on silent or near-silent audio.
+# Compared after lowercasing and stripping punctuation/whitespace.
+HALLUCINATION_PHRASES = {
+    "", "you", "thank you", "thank you.", "thanks", "thanks.",
+    "thanks for watching", "thanks for watching.", "thanks for watching!",
+    "thank you for watching", "thank you for watching.",
+    "thank you very much", "thank you so much",
+    "bye", "bye.", "bye bye", "goodbye",
+    "the end", "the end.", "end",
+    "please subscribe", "subscribe",
+    "i", "i.", "oh", "mm", "hm", "uh", "um",
+    "tak", "tak.", "tak for at se med", "tak for at se med.",  # Danish
+    "tack", "tack.", "tack för att ni tittade",  # Swedish
+    ".", "..", "...", "!", "?",
+}
 
 # Store models in ~/Library/Application Support so they persist across app updates
 _APP_SUPPORT = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Say the word")
@@ -1925,8 +1942,10 @@ wait $SAY_PID 2>/dev/null
 
             rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
             logging.info(f"Audio RMS: {rms:.1f}")
-            if rms < 100:
-                logging.info("Audio too quiet, skipping transcription")
+            # Raised from 100 → 180 to cut down on whisper hallucinating
+            # "Thank you." / "you" / etc. on near-silent audio.
+            if rms < 180 or duration < 0.4:
+                logging.info("Audio too quiet or too short, skipping transcription")
                 self.set_state_idle()
                 self.resume_all_audio()
                 return
@@ -1939,7 +1958,14 @@ wait $SAY_PID 2>/dev/null
                     wf.setframerate(SAMPLE_RATE)
                     wf.writeframes(audio_data.tobytes())
 
-                whisper_args = [WHISPER_CMD, "-m", MODEL_PATH, "-f", tmp.name, "--no-timestamps"]
+                whisper_args = [
+                    WHISPER_CMD, "-m", MODEL_PATH, "-f", tmp.name,
+                    "--no-timestamps",
+                    "--suppress-nst",          # suppress non-speech tokens at the source
+                    "--no-fallback",           # don't retry at higher temperatures (hallucinates)
+                    "--temperature", "0.0",    # deterministic
+                    "--no-speech-thold", "0.8",  # stricter silence gate (default 0.6)
+                ]
                 if self.language and self.language != "auto":
                     whisper_args += ["-l", self.language]
                 if HINT_WORDS:
@@ -1956,6 +1982,14 @@ wait $SAY_PID 2>/dev/null
                 # [BLANK_AUDIO], *foreign language*, <noise>. These describe audio, not words.
                 stripped = re.sub(r'\[[^\]\n]*\]|\*[^*\n]*\*|<[^>\n]*>', '', raw)
                 text = re.sub(r'\s+', ' ', stripped).strip(" .,\n")
+
+                # Whisper hallucinates a fixed set of phrases on silence/noise.
+                normalized = re.sub(r'[^\w\s]', '', text.lower()).strip()
+                if normalized in HALLUCINATION_PHRASES:
+                    logging.info(f"Filtered hallucination phrase: {text!r}")
+                    self.set_state_idle()
+                    self.resume_all_audio()
+                    return
 
                 PROMPT_WORDS = {w.lower() for w in HINT_WORDS} if HINT_WORDS else set()
                 text_words = set(text.lower().replace(",", "").replace(".", "").split())
@@ -2055,18 +2089,39 @@ wait $SAY_PID 2>/dev/null
         tap_disabled_timeout = getattr(Quartz, "kCGEventTapDisabledByTimeout", 0xFFFFFFFE)
         tap_disabled_user = getattr(Quartz, "kCGEventTapDisabledByUserInput", 0xFFFFFFFF)
 
+        # Single-worker queue so press/release are processed strictly in order.
+        # Without this, a quick release can race ahead of start_recording and
+        # leave the app stuck recording with no one to stop it.
+        self._fn_queue = queue.Queue()
+
+        def fn_worker():
+            while True:
+                action = self._fn_queue.get()
+                try:
+                    if action == "start":
+                        self.start_recording()
+                    elif action == "stop":
+                        self.stop_and_transcribe()
+                except Exception:
+                    logging.exception(f"Fn worker error handling {action}")
+
+        threading.Thread(target=fn_worker, daemon=True).start()
+
         def callback(proxy, event_type, event, refcon):
             nonlocal fn_held
 
-            # macOS disables the tap if a callback ever runs too long, or on
-            # certain user-input events. Without this, the hotkey silently
-            # dies and the app appears to crash. Re-enable and continue.
+            # macOS disables the tap if a callback ever runs long. Without
+            # this, the hotkey silently dies. Re-enable and flush any stale
+            # recording so we don't get stuck mid-recording.
             if event_type in (tap_disabled_timeout, tap_disabled_user):
                 logging.warning(f"Event tap disabled (type={event_type}); re-enabling")
                 try:
                     Quartz.CGEventTapEnable(app_ref._event_tap, True)
                 except Exception:
                     logging.exception("Failed to re-enable event tap")
+                if fn_held:
+                    fn_held = False
+                    app_ref._fn_queue.put("stop")
                 return event
 
             try:
@@ -2075,12 +2130,10 @@ wait $SAY_PID 2>/dev/null
 
                 if fn_now and not fn_held:
                     fn_held = True
-                    # Run off the callback thread so the tap stays responsive
-                    # and macOS never times it out.
-                    threading.Thread(target=app_ref.start_recording, daemon=True).start()
+                    app_ref._fn_queue.put("start")
                 elif not fn_now and fn_held:
                     fn_held = False
-                    threading.Thread(target=app_ref.stop_and_transcribe, daemon=True).start()
+                    app_ref._fn_queue.put("stop")
             except Exception:
                 logging.exception("Event tap callback error")
 
