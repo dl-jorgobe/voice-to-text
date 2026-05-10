@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dl.saytheword</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Say the word.app/Contents/MacOS/Say the word...</string>
+    </array>
+
+    <!-- Launch on login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- KeepAlive=true so launchd auto-restarts on ANY exit (jetsam kill,
+         crash, manual quit). The previous open-a launcher exited immediately
+         after launching the .app, so launchd had no child to monitor and
+         jetsam recoveries didn't actually fire. Now launchd is the parent. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/daniellindholt/Library/Application Support/Say the word/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/daniellindholt/Library/Application Support/Say the word/launchd.stderr.log</string>
+</dict>
+</plist>

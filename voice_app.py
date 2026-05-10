@@ -80,6 +80,21 @@ except (FileNotFoundError, json.JSONDecodeError) as e:
 LANG_LABELS = CONFIG.get("languages", ["EN"])
 WHISPER_CODES = CONFIG.get("whisper_codes", {"EN": "en"})
 HINT_WORDS = CONFIG.get("hint_words", [])
+REPLACEMENTS = CONFIG.get("replacements", {})
+
+# Compile case-insensitive whole-word patterns once. Whole-word matching avoids
+# substring damage (e.g. "Soren" → "Søren" should not touch "Sorensen").
+_REPLACEMENT_PATTERNS = [
+    (re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE), right)
+    for wrong, right in REPLACEMENTS.items()
+]
+
+def apply_replacements(text):
+    """Deterministic post-processing for proper nouns and brand names that
+    Whisper consistently mis-spells. Driven by config.replacements."""
+    for pat, right in _REPLACEMENT_PATTERNS:
+        text = pat.sub(right, text)
+    return text
 
 # Whisper confidently hallucinates these phrases on silent or near-silent audio.
 # Compared after lowercasing and stripping punctuation/whitespace (exact match).
@@ -120,10 +135,28 @@ HALLUCINATION_SUBSTRINGS = (
 # Store models in ~/Library/Application Support so they persist across app updates
 _APP_SUPPORT = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Say the word")
 _MODELS_DIR = os.path.join(_APP_SUPPORT, "models")
-# Also check the script directory for backwards compatibility (dev mode)
+
+# Two-tier model strategy. The app prefers the larger turbo model when present;
+# otherwise it falls back to the original "small" model so existing installs
+# keep working. The turbo model is offered as a one-time upgrade in setup.
 _DEV_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "ggml-small.bin")
 MODEL_PATH = _DEV_MODEL_PATH if os.path.exists(_DEV_MODEL_PATH) else os.path.join(_MODELS_DIR, "ggml-small.bin")
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+
+# Large-v3-turbo, q8_0 quantized: ~830 MB, near-large quality, real-time on M-series.
+TURBO_MODEL_PATH = os.path.join(_MODELS_DIR, "ggml-large-v3-turbo-q8_0.bin")
+TURBO_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin"
+
+# Silero VAD model used by whisper.cpp's --vad flag. Replaces the RMS-threshold
+# hack and stops most "Thank you" hallucinations on silence at the source.
+VAD_MODEL_PATH = os.path.join(_MODELS_DIR, "ggml-silero-v5.1.2.bin")
+VAD_MODEL_URL = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
+
+# whisper-server: keeps the model resident in memory across transcriptions,
+# eliminating the 465 MB cold-load every Fn-press caused. Bound to localhost
+# only; non-default port to avoid collisions with anything on 8080.
+WHISPER_SERVER_PORT = 8124
+WHISPER_SERVER_URL = f"http://127.0.0.1:{WHISPER_SERVER_PORT}/inference"
 
 def _find_whisper_cli():
     """Find whisper-cli, checking common locations."""
@@ -139,6 +172,217 @@ def _find_whisper_cli():
     return None
 
 WHISPER_CMD = _find_whisper_cli()
+
+
+def _find_whisper_server():
+    """Find whisper-server (ships with the same whisper-cpp Homebrew formula)."""
+    for path in ["/opt/homebrew/bin/whisper-server", "/usr/local/bin/whisper-server"]:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+WHISPER_SERVER_CMD = _find_whisper_server()
+
+
+def _pick_active_model_path():
+    """Prefer the resident turbo model; fall back to small if turbo isn't present."""
+    if os.path.exists(TURBO_MODEL_PATH):
+        return TURBO_MODEL_PATH
+    return MODEL_PATH
+
+
+# Tracks the running whisper-server subprocess so we can kill it cleanly on exit.
+_whisper_server_proc = None
+
+
+def _start_whisper_server():
+    """Spawn whisper-server bound to localhost. Loads the model once, persists
+    across all transcriptions for the life of the app. Returns True if the
+    server is reachable within ~15 seconds; False otherwise (caller falls
+    back to per-shot whisper-cli)."""
+    global _whisper_server_proc
+
+    if _whisper_server_proc and _whisper_server_proc.poll() is None:
+        return True  # already running
+
+    if not WHISPER_SERVER_CMD:
+        logging.warning("whisper-server binary not found; staying on whisper-cli path")
+        return False
+
+    model = _pick_active_model_path()
+    if not os.path.exists(model):
+        logging.warning(f"No whisper model at {model}; not starting server")
+        return False
+
+    args = [
+        WHISPER_SERVER_CMD,
+        "-m", model,
+        "--host", "127.0.0.1",
+        "--port", str(WHISPER_SERVER_PORT),
+        "--inference-path", "/inference",
+        "--no-timestamps",
+        "--suppress-nst",
+        "--no-fallback",
+    ]
+    if os.path.exists(VAD_MODEL_PATH):
+        args += ["--vad", "--vad-model", VAD_MODEL_PATH]
+
+    logging.info(f"Starting whisper-server: model={os.path.basename(model)} vad={os.path.exists(VAD_MODEL_PATH)}")
+    try:
+        _whisper_server_proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        logging.exception("Failed to spawn whisper-server")
+        _whisper_server_proc = None
+        return False
+
+    import socket
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if _whisper_server_proc.poll() is not None:
+            logging.error("whisper-server exited during startup")
+            _whisper_server_proc = None
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", WHISPER_SERVER_PORT), timeout=0.5):
+                logging.info("whisper-server ready")
+                return True
+        except OSError:
+            time.sleep(0.25)
+
+    logging.warning("whisper-server did not bind within 15s")
+    _stop_whisper_server()
+    return False
+
+
+def _stop_whisper_server():
+    """Kill the server cleanly. Called from atexit and the watchdog."""
+    global _whisper_server_proc
+    if _whisper_server_proc and _whisper_server_proc.poll() is None:
+        try:
+            _whisper_server_proc.terminate()
+            _whisper_server_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _whisper_server_proc.kill()
+            except Exception:
+                pass
+    _whisper_server_proc = None
+
+
+# Single-flight lock so concurrent failure signals don't spawn multiple servers.
+_server_restart_lock = threading.Lock()
+_server_restarting = False
+
+
+def _restart_whisper_server_async(reason):
+    """Triggered from the live transcription path or the watchdog when the
+    server appears dead/hung. Kills the existing process and starts a fresh
+    one in a background thread so we don't block the audio path. The current
+    transcription falls back to whisper-cli; the next one uses the new server."""
+    global _server_restarting
+    with _server_restart_lock:
+        if _server_restarting:
+            return  # another thread is already on it
+        _server_restarting = True
+
+    def _worker():
+        global _server_restarting
+        try:
+            logging.warning(f"whisper-server restart triggered: {reason}")
+            _stop_whisper_server()
+            ok = _start_whisper_server()
+            logging.info(f"whisper-server restart {'succeeded' if ok else 'failed'}")
+        finally:
+            _server_restarting = False
+
+    threading.Thread(target=_worker, daemon=True, name="whisper-server-restart").start()
+
+
+def _whisper_server_health_check():
+    """Returns True if the server is alive and the port answers within 1 s."""
+    global _whisper_server_proc
+    if not _whisper_server_proc or _whisper_server_proc.poll() is not None:
+        return False
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", WHISPER_SERVER_PORT), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _whisper_server_watchdog():
+    """Long-running daemon thread. Pings the server every 60 s and triggers a
+    restart if it's dead or unresponsive. Catches the rare case where the
+    server hangs without anyone making a transcription request — we don't want
+    Daniel to discover the hang only by pressing Fn and getting silence."""
+    while True:
+        time.sleep(60)
+        try:
+            if _whisper_server_proc is None:
+                continue  # server was never started or was permanently disabled
+            if not _whisper_server_health_check():
+                _restart_whisper_server_async("watchdog ping failed")
+        except Exception:
+            logging.exception("whisper-server watchdog tick failed")
+
+
+def _transcribe_via_server(wav_path, language=None, prompt=None):
+    """POST a WAV file to the resident whisper-server. Returns the transcribed
+    text, or None on any failure (caller will fall back to whisper-cli)."""
+    import urllib.request
+    import urllib.error
+    boundary = "----whisperboundary" + str(int(time.time() * 1000))
+    crlf = b"\r\n"
+
+    parts = []
+
+    def add_field(name, value):
+        parts.append(("--" + boundary).encode())
+        parts.append(f'Content-Disposition: form-data; name="{name}"'.encode())
+        parts.append(b"")
+        parts.append(str(value).encode())
+
+    add_field("temperature", "0.0")
+    add_field("response_format", "text")
+    add_field("no_speech_thold", "0.8")
+    if language and language != "auto":
+        add_field("language", language)
+    if prompt:
+        add_field("prompt", prompt)
+
+    parts.append(("--" + boundary).encode())
+    parts.append(b'Content-Disposition: form-data; name="file"; filename="audio.wav"')
+    parts.append(b"Content-Type: audio/wav")
+    parts.append(b"")
+    with open(wav_path, "rb") as f:
+        parts.append(f.read())
+    parts.append(("--" + boundary + "--").encode())
+    parts.append(b"")
+
+    body = crlf.join(parts)
+    req = urllib.request.Request(
+        WHISPER_SERVER_URL,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        logging.warning(f"whisper-server request failed: {e}")
+        # Schedule a server restart so the next transcription works.
+        # The current call falls back to whisper-cli upstream.
+        _restart_whisper_server_async(f"request error: {e}")
+        return None
+
 
 def _first_run_setup():
     """Check dependencies and download model on first run. Returns True if ready."""
@@ -206,6 +450,69 @@ def _first_run_setup():
             sys.exit(1)
 
     return True
+
+
+def _offer_turbo_upgrade():
+    """Offer the larger Whisper model + VAD model as a one-time upgrade.
+    Non-fatal: if the user declines or the download fails, the app keeps
+    running on the existing small model. A marker file silences the prompt
+    after the first decline."""
+    os.makedirs(_MODELS_DIR, exist_ok=True)
+    decline_marker = os.path.join(_MODELS_DIR, ".upgrade_declined")
+
+    has_turbo = os.path.exists(TURBO_MODEL_PATH)
+    has_vad = os.path.exists(VAD_MODEL_PATH)
+    if has_turbo and has_vad:
+        return
+    if os.path.exists(decline_marker):
+        return
+
+    msg = (
+        "Upgrade speech accuracy?\\n\\n"
+        "The new model (large-v3-turbo, ~830 MB) and VAD model (~2 MB) "
+        "give much better Danish + proper-noun accuracy and stop most "
+        "false transcriptions on silence.\\n\\n"
+        "Total one-time download: ~830 MB."
+    )
+    result = subprocess.run(
+        ["osascript", "-e",
+         f'display dialog "{msg}" buttons {{"Skip", "Upgrade"}} default button "Upgrade" with title "Smarter Transcription"'],
+        capture_output=True, text=True,
+    )
+    if "Upgrade" not in result.stdout:
+        try:
+            open(decline_marker, "w").close()
+        except OSError:
+            pass
+        return
+
+    if not has_turbo:
+        print("Downloading large-v3-turbo model...")
+        dl = subprocess.run(
+            ["curl", "-L", "--progress-bar", "-o", TURBO_MODEL_PATH, TURBO_MODEL_URL],
+            timeout=1800,
+        )
+        if dl.returncode != 0 or not os.path.exists(TURBO_MODEL_PATH):
+            logging.warning("Turbo model download failed; staying on small model")
+            try:
+                if os.path.exists(TURBO_MODEL_PATH):
+                    os.unlink(TURBO_MODEL_PATH)
+            except OSError:
+                pass
+
+    if not has_vad:
+        print("Downloading Silero VAD model...")
+        dl = subprocess.run(
+            ["curl", "-L", "--progress-bar", "-o", VAD_MODEL_PATH, VAD_MODEL_URL],
+            timeout=120,
+        )
+        if dl.returncode != 0 or not os.path.exists(VAD_MODEL_PATH):
+            logging.warning("VAD model download failed; running without VAD")
+            try:
+                if os.path.exists(VAD_MODEL_PATH):
+                    os.unlink(VAD_MODEL_PATH)
+            except OSError:
+                pass
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FN_FLAG = 1 << 23
@@ -1048,6 +1355,7 @@ class MiniToggleView(NSView):
 class VoiceToTextApp:
     def __init__(self):
         self.recording = False
+        self.transcribing = False
         self.audio_frames = []
         self.stream = None
         self.paused_sources = []
@@ -1063,7 +1371,11 @@ class VoiceToTextApp:
         self._speech_threshold = 300  # RMS threshold for "speaking" (int16 audio)
 
         self.app = NSApplication.sharedApplication()
-        self.app.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
+        # NSApplicationActivationPolicyRegular (0). This is the original setting
+        # that worked for Daniel daily. I tried Accessory (1) thinking it would
+        # fix global hotkey throttling — it didn't, and may have broken
+        # something in the permission tie-in. Reverted.
+        self.app.setActivationPolicy_(0)
 
         self.build_window()
         self.set_dock_icon()
@@ -1636,7 +1948,13 @@ wait $SAY_PID 2>/dev/null
     # ── UI updates (main thread) ────────────────────────────────────────
 
     def copy_to_clipboard(self, text):
-        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        # NSPasteboard handles unicode natively. Avoids the pbcopy bug where
+        # bundle-launched apps inherit no LANG and the subprocess writes
+        # MacRoman bytes to the clipboard, mojibaking Danish characters
+        # (Søren → S√∏ren, på → p√•).
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
         def _():
             self.status_label.setStringValue_("Copied!")
             self.perform_selector_delayed("_reset_status")
@@ -1890,6 +2208,11 @@ wait $SAY_PID 2>/dev/null
 
     def audio_callback(self, indata, frames, time_info, status):
         if self.recording:
+            # Log the first frame after a recording starts so we can spot
+            # cases where the stream opens but never delivers data (mic in
+            # use by another app, sleep/wake glitch, etc.)
+            if not self.audio_frames:
+                logging.info(f"audio_callback: first frame ({frames} samples)")
             self.audio_frames.append(indata.copy())
             # Auto-stop on silence in hands-free mode
             if self._auto_stop_enabled:
@@ -1904,6 +2227,20 @@ wait $SAY_PID 2>/dev/null
                     threading.Thread(target=self.stop_and_transcribe, daemon=True).start()
 
     def start_recording(self):
+        # Throttle: when the mic is broken (USB unplugged, device asleep,
+        # another app holding it), each Fn press used to cascade into a
+        # PortAudio -9986 error every ~50 ms. Cap retries to once per second.
+        now = time.time()
+        last_fail = getattr(self, "_last_mic_fail_ts", 0.0)
+        if (now - last_fail) < 1.0:
+            return
+        # Re-entry guard. If a previous recording is still being transcribed
+        # (whisper-server can take several seconds on long clips), a fresh Fn
+        # press used to overlap audio streams and pile up concurrent requests
+        # — which deadlocked whisper-server. Bounce the press instead.
+        if getattr(self, "recording", False) or getattr(self, "transcribing", False):
+            logging.info("Fn pressed but already recording/transcribing — ignoring")
+            return
         try:
             logging.info("Fn pressed — recording")
             # Stop clap monitor stream before opening recording stream
@@ -1916,16 +2253,18 @@ wait $SAY_PID 2>/dev/null
             self._last_speech_time = time.time()
             self._has_spoken = False
             self.recording = True
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS,
-                dtype="int16", callback=self.audio_callback,
-            )
+            self.stream = self._open_input_stream()
             self.stream.start()
             self.set_state_recording()
             threading.Thread(target=self._pause_bg, daemon=True).start()
         except sd.PortAudioError:
             logging.exception("Microphone access denied or unavailable")
             self.recording = False
+            self._last_mic_fail_ts = time.time()
+            # Reset PortAudio so it rescans devices. Without this, once a
+            # mic disconnects, every future open call returns -9986 until
+            # the whole app is restarted.
+            self._reset_portaudio()
             def _warn():
                 self.dot_text.setText_("No mic")
                 self.status_label.setStringValue_(
@@ -1935,6 +2274,37 @@ wait $SAY_PID 2>/dev/null
         except Exception:
             logging.exception("Error starting recording")
             self.recording = False
+            self._last_mic_fail_ts = time.time()
+
+    def _open_input_stream(self):
+        """Open the recording InputStream with one retry after a PortAudio reset.
+        The retry handles transient -9986 errors that occur after device
+        changes (headset plugged/unplugged, sleep/wake) where PortAudio's
+        cached device list is stale."""
+        try:
+            return sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS,
+                dtype="int16", callback=self.audio_callback,
+            )
+        except sd.PortAudioError:
+            logging.warning("InputStream open failed; resetting PortAudio and retrying once")
+            self._reset_portaudio()
+            return sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS,
+                dtype="int16", callback=self.audio_callback,
+            )
+
+    @staticmethod
+    def _reset_portaudio():
+        """Force PortAudio to rescan devices by terminating and reinitialising
+        the host API. This is the only way to recover from -9986 without
+        restarting the whole app."""
+        try:
+            sd._terminate()
+            sd._initialize()
+            logging.info("PortAudio reinitialised")
+        except Exception:
+            logging.exception("PortAudio reset failed")
 
     def _pause_bg(self):
         self.paused_sources = self.pause_all_audio()
@@ -1943,6 +2313,7 @@ wait $SAY_PID 2>/dev/null
         try:
             logging.info("Fn released — transcribing")
             self.recording = False
+            self.transcribing = True
             if self.stream:
                 self.stream.stop()
                 self.stream.close()
@@ -1962,9 +2333,12 @@ wait $SAY_PID 2>/dev/null
 
             rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
             logging.info(f"Audio RMS: {rms:.1f}")
-            # Raised from 100 → 180 to cut down on whisper hallucinating
-            # "Thank you." / "you" / etc. on near-silent audio.
-            if rms < 180 or duration < 0.4:
+            # Loosened from rms<180/dur<0.4 to rms<25/dur<0.15. The old gate
+            # was rejecting normal-volume speech. Hallucination filtering is
+            # now Silero VAD's job (running inside whisper-server) plus the
+            # explicit hallucination phrase list — so this gate only needs to
+            # filter empty audio and accidental finger-bumps.
+            if rms < 25 or duration < 0.15:
                 logging.info("Audio too quiet or too short, skipping transcription")
                 self.set_state_idle()
                 self.resume_all_audio()
@@ -1978,26 +2352,40 @@ wait $SAY_PID 2>/dev/null
                     wf.setframerate(SAMPLE_RATE)
                     wf.writeframes(audio_data.tobytes())
 
-                whisper_args = [
-                    WHISPER_CMD, "-m", MODEL_PATH, "-f", tmp.name,
-                    "--no-timestamps",
-                    "--suppress-nst",          # suppress non-speech tokens at the source
-                    "--no-fallback",           # don't retry at higher temperatures (hallucinates)
-                    "--temperature", "0.0",    # deterministic
-                    "--no-speech-thold", "0.8",  # stricter silence gate (default 0.6)
-                ]
-                if self.language and self.language != "auto":
-                    whisper_args += ["-l", self.language]
-                if HINT_WORDS:
-                    whisper_args += ["--prompt", ", ".join(HINT_WORDS)]
-                result = subprocess.run(
-                    whisper_args,
-                    capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=30,
-                )
+                # Try the resident whisper-server first (fast: model already
+                # loaded). Fall back to per-shot whisper-cli if server isn't
+                # running or the request fails.
+                prompt = ", ".join(HINT_WORDS) if HINT_WORDS else None
+                lang = self.language if self.language and self.language != "auto" else None
+                server_text = None
+                if _whisper_server_proc and _whisper_server_proc.poll() is None:
+                    server_text = _transcribe_via_server(tmp.name, language=lang, prompt=prompt)
 
-                logging.info(f"whisper stdout: {result.stdout!r}")
-
-                raw = result.stdout.strip()
+                if server_text is not None:
+                    raw = server_text.strip()
+                    logging.info(f"whisper-server output: {raw!r}")
+                else:
+                    active_model = _pick_active_model_path()
+                    whisper_args = [
+                        WHISPER_CMD, "-m", active_model, "-f", tmp.name,
+                        "--no-timestamps",
+                        "--suppress-nst",
+                        "--no-fallback",
+                        "--temperature", "0.0",
+                        "--no-speech-thold", "0.8",
+                    ]
+                    if os.path.exists(VAD_MODEL_PATH):
+                        whisper_args += ["--vad", "--vad-model", VAD_MODEL_PATH]
+                    if lang:
+                        whisper_args += ["-l", lang]
+                    if prompt:
+                        whisper_args += ["--prompt", prompt]
+                    result = subprocess.run(
+                        whisper_args,
+                        capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=30,
+                    )
+                    logging.info(f"whisper stdout: {result.stdout!r}")
+                    raw = result.stdout.strip()
                 # Strip whisper non-speech tags like [Music], [Sounds of people talking],
                 # [BLANK_AUDIO], *foreign language*, <noise>. These describe audio, not words.
                 stripped = re.sub(r'\[[^\]\n]*\]|\*[^*\n]*\*|<[^>\n]*>', '', raw)
@@ -2019,9 +2407,15 @@ wait $SAY_PID 2>/dev/null
                     self.resume_all_audio()
                     return
 
+                # Catch cases where Whisper just regurgitates the prompt back
+                # on noise. With the expanded 68-word glossary, the "all words
+                # in glossary" check would fire on legitimate short phrases
+                # like "the campaign flow" — so only flag <=3 words and ignore
+                # common stop-words that pad legitimate input.
                 PROMPT_WORDS = {w.lower() for w in HINT_WORDS} if HINT_WORDS else set()
-                text_words = set(text.lower().replace(",", "").replace(".", "").split())
-                if text_words and text_words.issubset(PROMPT_WORDS):
+                text_words = [w for w in text.lower().replace(",", "").replace(".", "").split()
+                              if w not in {"the", "a", "an", "and", "or", "to", "of", "i", "is"}]
+                if 0 < len(text_words) <= 3 and set(text_words).issubset(PROMPT_WORDS):
                     logging.info(f"Filtered prompt hallucination: {text}")
                     self.set_state_idle()
                     self.resume_all_audio()
@@ -2033,6 +2427,14 @@ wait $SAY_PID 2>/dev/null
                     self.resume_all_audio()
                     return
 
+                # Deterministic proper-noun fixes (Jorgo Bay → Jorgobé,
+                # Soren → Søren, Klavio → Klaviyo, etc.). Driven by
+                # config.replacements so Daniel can tune without code edits.
+                before_replace = text
+                text = apply_replacements(text)
+                if text != before_replace:
+                    logging.info(f"Post-processed: {before_replace!r} → {text!r}")
+
                 logging.info(f"Transcribed: {text}")
                 self.set_last_text(text)
 
@@ -2043,7 +2445,13 @@ wait $SAY_PID 2>/dev/null
                 else:
                     # Clipboard paste for Fn mode (faster for long text)
                     saved = self._clipboard_save()
-                    subprocess.run(["pbcopy"], input=text.encode(), check=True)
+                    pb = AppKit.NSPasteboard.generalPasteboard()
+                    pb.clearContents()
+                    pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+                    # Verify the text actually landed on the clipboard before
+                    # we send Cmd+V — small belt-and-braces sanity log.
+                    actual = pb.stringForType_(AppKit.NSPasteboardTypeString) or ""
+                    logging.info(f"clipboard set ({len(actual)} chars). Posting Cmd+V")
                     self.simulate_paste()
                     time.sleep(0.5)
                     self._clipboard_restore(saved)
@@ -2057,6 +2465,8 @@ wait $SAY_PID 2>/dev/null
             logging.exception("Error in transcription")
             self.set_state_idle()
         finally:
+            # Always clear the re-entry guard, even on error paths.
+            self.transcribing = False
             # Restart clap monitor if hands-free is still active
             if self.hands_free_mode:
                 self._stop_clap_monitor.clear()
@@ -2092,6 +2502,23 @@ wait $SAY_PID 2>/dev/null
             time.sleep(0.003)  # small delay between chars for reliability
 
     def simulate_paste(self):
+        # Try osascript-based paste first (uses System Events automation —
+        # more permission-stable than raw CGEventPost since macOS Sequoia,
+        # which has tightened kTCCServicePostEvent for adhoc-signed apps).
+        # Fall back to CGEventPost if osascript fails.
+        logging.info("simulate_paste: trying osascript Cmd+V")
+        try:
+            r = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to keystroke "v" using command down'],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode == 0:
+                return
+            logging.warning(f"osascript paste failed (rc={r.returncode}): {r.stderr.strip()}; falling back to CGEventPost")
+        except Exception as e:
+            logging.warning(f"osascript paste error: {e}; falling back to CGEventPost")
+
         source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
         key_down = CGEventCreateKeyboardEvent(source, 9, True)
         key_up = CGEventCreateKeyboardEvent(source, 9, False)
@@ -2158,23 +2585,65 @@ wait $SAY_PID 2>/dev/null
 
                 if fn_now and not fn_held:
                     fn_held = True
-                    app_ref._fn_queue.put("start")
+                    # put_nowait so the callback never blocks waiting for the
+                    # queue lock. Under Python GIL contention a blocking put
+                    # was making macOS think the tap "missed events" and
+                    # firing kCGEventTapDisabledByUserInput, breaking global
+                    # hotkey delivery.
+                    try:
+                        app_ref._fn_queue.put_nowait("start")
+                    except queue.Full:
+                        pass
                 elif not fn_now and fn_held:
                     fn_held = False
-                    app_ref._fn_queue.put("stop")
+                    try:
+                        app_ref._fn_queue.put_nowait("stop")
+                    except queue.Full:
+                        pass
             except Exception:
-                logging.exception("Event tap callback error")
+                # Never logging.exception inside the tap callback — disk I/O
+                # under contention is the very thing that triggers the OS
+                # throttle. Errors here are silently swallowed.
+                pass
 
             return event
 
-        event_mask = CGEventMaskBit(kCGEventFlagsChanged)
+        self._event_tap_event_mask = CGEventMaskBit(kCGEventFlagsChanged)
         self._event_tap_callback = callback  # prevent GC
+
+        if not self._create_event_tap():
+            return
+
+        # Watchdog: macOS Sequoia aggressively throttles event taps from
+        # adhoc-signed apps under memory pressure, sometimes permanently
+        # disabling them. The in-callback re-enable call silently fails in
+        # those cases. This thread polls the tap's enabled state every 2s
+        # and fully recreates it if it's dead.
+        threading.Thread(target=self._event_tap_watchdog, daemon=True,
+                         name="event-tap-watchdog").start()
+
+    def _create_event_tap(self):
+        """Create or recreate the global event tap. Idempotent: if a tap
+        already exists, releases it first. Returns True on success."""
+        # Tear down any existing tap so we don't leak run loop sources
+        old_source = getattr(self, "_event_tap_source", None)
+        if old_source is not None:
+            try:
+                Quartz.CFRunLoopRemoveSource(
+                    Quartz.CFRunLoopGetMain(), old_source,
+                    Quartz.kCFRunLoopCommonModes,
+                )
+            except Exception:
+                pass
+            self._event_tap_source = None
+        self._event_tap = None
+
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
             Quartz.kCGEventTapOptionListenOnly,
-            event_mask,
-            callback,
+            self._event_tap_event_mask,
+            self._event_tap_callback,
             None,
         )
 
@@ -2186,16 +2655,38 @@ wait $SAY_PID 2>/dev/null
                     "Grant Accessibility in System Settings"
                 )
             self.on_main(_warn)
-            return
+            return False
 
-        self._event_tap = tap  # prevent GC
+        self._event_tap = tap
         run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-        self._event_tap_source = run_loop_source  # prevent GC
+        self._event_tap_source = run_loop_source
         Quartz.CFRunLoopAddSource(
             Quartz.CFRunLoopGetMain(), run_loop_source, Quartz.kCFRunLoopCommonModes
         )
         Quartz.CGEventTapEnable(tap, True)
         logging.info("Event tap active")
+        return True
+
+    def _event_tap_watchdog(self):
+        """Polls the event tap state every 5 s. If macOS disabled it (memory
+        pressure, etc.), call CGEventTapEnable to wake it back up.
+
+        Earlier I tried full recreate-from-scratch (CFRunLoopRemoveSource +
+        CFMachPortCreateRunLoopSource on a background thread). That threw
+        NSException from Objective-C land that killed the whole process,
+        causing a launchd crash-loop. CGEventTapEnable is idempotent and
+        thread-safe — much safer."""
+        while True:
+            time.sleep(5.0)
+            try:
+                tap = getattr(self, "_event_tap", None)
+                if tap is None:
+                    continue
+                if not Quartz.CGEventTapIsEnabled(tap):
+                    Quartz.CGEventTapEnable(tap, True)
+            except Exception:
+                # Watchdog must never crash the app
+                pass
 
     def run(self):
         self.app.run()
@@ -2227,6 +2718,20 @@ if __name__ == "__main__":
     # Re-discover whisper-cli in case it was just installed
     if not WHISPER_CMD:
         WHISPER_CMD = _find_whisper_cli()
+    if not WHISPER_SERVER_CMD:
+        WHISPER_SERVER_CMD = _find_whisper_server()
+
+    # Offer the turbo + VAD upgrade (skippable, asked once)
+    _offer_turbo_upgrade()
+
+    # Spawn the resident whisper-server. If this fails the app falls back
+    # to per-shot whisper-cli automatically.
+    import atexit
+    if _start_whisper_server():
+        atexit.register(_stop_whisper_server)
+    # Watchdog: pings the server every 60 s, restarts it if dead/hung.
+    threading.Thread(target=_whisper_server_watchdog, daemon=True,
+                     name="whisper-server-watchdog").start()
 
     # Kill any existing instances — verify it's actually voice_app before killing
     import signal
