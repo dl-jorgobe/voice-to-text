@@ -14,12 +14,14 @@
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- KeepAlive=true so launchd auto-restarts on ANY exit (jetsam kill,
-         crash, manual quit). The previous open-a launcher exited immediately
-         after launching the .app, so launchd had no child to monitor and
-         jetsam recoveries didn't actually fire. Now launchd is the parent. -->
+    <!-- KeepAlive only restarts after non-clean exits (crashes, jetsam
+         kills). A clean Cmd+Q exit stays exited so Daniel can actually
+         close the app when he wants. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
